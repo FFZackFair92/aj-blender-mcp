@@ -12,10 +12,10 @@ nessuna telemetria.
 Claude  <--stdio-->  blender_mcp.py  <--HTTP locale :9991-->  aj_blender_bridge.py (add-on di Blender)
 ```
 
-> **Stato:** i test offline passano contro un finto Blender (`fake_bpy.py`), con
-> l'add-on vero in esecuzione. La prova con Blender vero si fa con
-> `check_live.py`: finche' non l'hai lanciata, considera l'add-on non verificato
-> sulla tua versione. Pensato per Blender 3.6 o successivo.
+> **Stato:** provato dal vivo con Blender 5.2.1 LTS su Windows (`check_live.py`):
+> oggetti, materiali, modificatori, vista 3D, import ed export glb/obj/stl/fbx.
+> Non provati dal vivo: `save_file` e il formato usd. I test offline girano
+> contro un finto Blender (`fake_bpy.py`). Pensato per Blender 3.6 o successivo.
 
 ## 1. Installa uv
 
