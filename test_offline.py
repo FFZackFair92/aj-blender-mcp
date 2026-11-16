@@ -149,6 +149,11 @@ d = do(m.delete_objects, ["Cubo", "Manca"])
 assert d == {"deleted": ["Cubo"], "missing": ["Manca"]}, d
 assert do(m.blender_status)["objects"] == 8
 
+# --- avvio: con il ponte attivo non lancia niente
+os.environ["AJ_BLENDER_EXE"] = str(HERE / "non_esiste.exe")
+already = do(m.open_blender)
+assert already["opened"] is False and "gia' aperto" in already["note"], already
+
 # --- Blender chiuso
 bridge.unregister()
 try:
@@ -157,7 +162,28 @@ try:
 except RuntimeError as e:
     assert "non risponde" in str(e), e
 
+# --- avvio a programma chiuso: eseguibile mancante, poi eseguibile finto che non apre il ponte
+try:
+    m.open_blender(wait_seconds=1)
+    raise AssertionError("mancava l'errore di eseguibile non trovato")
+except RuntimeError as e:
+    assert "non trovato" in str(e), e
+os.environ["AJ_BLENDER_EXE"] = sys.executable
+finto = Path(tempfile.mkdtemp()) / "finto.py"
+finto.write_text("pass\n", encoding="utf-8")
+try:
+    m.open_blender(str(finto), wait_seconds=1)
+    raise AssertionError("mancava l'errore di ponte che non risponde")
+except RuntimeError as e:
+    assert "avviato" in str(e) and "ponte non risponde" in str(e), e
+try:
+    m.open_blender(str(finto) + ".manca", wait_seconds=1)
+    raise AssertionError("mancava l'errore di file non trovato")
+except RuntimeError as e:
+    assert "file non trovato" in str(e), e
+os.environ.pop("AJ_BLENDER_EXE")
+
 tools = asyncio.run(m.mcp.list_tools())
 names = sorted(t.name for t in tools)
-assert len(names) == 13, names
+assert len(names) == 14, names
 print(f"ok: {len(names)} tool -> {', '.join(names)}")

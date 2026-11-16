@@ -53,6 +53,9 @@ Crea oggetti di prova, verifica ogni funzione e li elimina.
 
 ## Tool
 
+**Avvio** — `open_blender(file, wait_seconds)`: apre Blender (o un .blend) e aspetta
+il ponte; se e' gia' aperto non ne apre un altro
+
 **Lettura** — `blender_status` · `scene_info(limit)` · `object_info(name)` ·
 `viewport_screenshot(max_size)`
 
@@ -87,6 +90,7 @@ Chi ha quel file puo' pilotare Blender: non condividerlo.
 |---|---|---|
 | `AJ_BLENDER_URL` | `http://127.0.0.1:9991` | indirizzo del ponte (lato server MCP) |
 | `AJ_BLENDER_TOKEN` | letto dal file | token, se vuoi passarlo a mano |
+| `AJ_BLENDER_EXE` | cercato da solo | eseguibile di Blender per `open_blender` |
 | `AJ_BLENDER_PORT` | `9991` | porta del ponte (va impostata prima di avviare Blender) |
 
 ## File

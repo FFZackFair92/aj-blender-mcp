@@ -10,10 +10,16 @@ Lavora solo sulla scena locale: nessun servizio esterno, nessuna chiave API.
 Config (variabili d'ambiente, tutte facoltative):
   AJ_BLENDER_URL    indirizzo del ponte  (default http://127.0.0.1:9991)
   AJ_BLENDER_TOKEN  token                (default: letto da ~/.aj-mcp/blender.token)
+  AJ_BLENDER_EXE    eseguibile di Blender per open_blender (default: cercato da solo)
 """
 import base64
+import glob
 import json
 import os
+import shutil
+import subprocess
+import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -65,6 +71,75 @@ def call(cmd: str, **args: Any) -> Any:
     if not reply.get("ok"):
         raise RuntimeError(reply.get("error", "errore sconosciuto"))
     return reply["result"]
+
+
+# -------------------------------------------------------------------- avvio
+def _version_key(path: str) -> list[int]:
+    digits = "".join(c if c.isdigit() else " " for c in path).split()
+    return [int(d) for d in digits]
+
+
+def find_blender() -> str | None:
+    """Percorso dell'eseguibile di Blender: AJ_BLENDER_EXE, poi il PATH, poi le
+    cartelle di installazione abituali (la versione piu' recente)."""
+    env = os.environ.get("AJ_BLENDER_EXE")
+    if env:
+        return env if os.path.isfile(env) else None
+    found = shutil.which("blender")
+    if found:
+        return found
+    if sys.platform == "win32":
+        roots = [os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramW6432", "")]
+        hits = [p for r in roots if r for p in glob.glob(os.path.join(r, "Blender Foundation", "Blender*", "blender.exe"))]
+    elif sys.platform == "darwin":
+        hits = glob.glob("/Applications/Blender*.app/Contents/MacOS/Blender")
+    else:
+        hits = glob.glob("/opt/blender*/blender") + glob.glob(os.path.expanduser("~/blender*/blender"))
+    return max(hits, key=_version_key) if hits else None
+
+
+def _launch(command: list[str]) -> None:
+    """Avvia un programma staccato da questo processo, cosi' resta aperto."""
+    quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if sys.platform == "win32":
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        subprocess.Popen(command, creationflags=flags, close_fds=True, **quiet)
+    else:
+        subprocess.Popen(command, start_new_session=True, close_fds=True, **quiet)
+
+
+@mcp.tool()
+def open_blender(file: str = "", wait_seconds: int = 60) -> dict:
+    """Apre Blender su questo computer e aspetta che il ponte risponda.
+
+    Se Blender e' gia' aperto con il ponte attivo non ne apre un altro.
+    file: un .blend da aprire (facoltativo). wait_seconds: quanto aspettare il ponte.
+    """
+    try:
+        return {"opened": False, "note": "Blender era gia' aperto", **call("status")}
+    except RuntimeError as e:
+        if "non risponde" not in str(e) and "Token non trovato" not in str(e):
+            raise
+    exe = find_blender()
+    if exe is None:
+        raise RuntimeError("Blender non trovato: installalo o indica il percorso nella variabile AJ_BLENDER_EXE.")
+    command = [exe]
+    if file:
+        path = os.path.abspath(os.path.expanduser(file))
+        if not os.path.isfile(path):
+            raise RuntimeError(f"file non trovato: {path}")
+        command.append(path)
+    _launch(command)
+    deadline = time.time() + max(1, min(int(wait_seconds), 300))
+    while time.time() < deadline:
+        time.sleep(1)
+        try:
+            return {"opened": True, "executable": exe, **call("status")}
+        except RuntimeError:
+            continue
+    raise RuntimeError(
+        f"Blender e' stato avviato ({exe}) ma il ponte non risponde: controlla che l'add-on AJ MCP Bridge sia attivo."
+    )
 
 
 # ------------------------------------------------------------------- lettura
