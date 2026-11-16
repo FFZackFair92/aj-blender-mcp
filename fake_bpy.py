@@ -208,7 +208,6 @@ utils = _t.SimpleNamespace(register_class=lambda c: None, unregister_class=lambd
 
 class _Types(_t.SimpleNamespace):
     Panel = object
-    WM_OT_obj_import = WM_OT_obj_export = WM_OT_stl_import = WM_OT_stl_export = object
 
 
 def run_main_loop(until, timeout=30):

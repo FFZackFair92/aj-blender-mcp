@@ -139,8 +139,20 @@ def _view3d():
     raise RuntimeError("nessuna vista 3D aperta: apri un editor 3D Viewport")
 
 
-def _has_op(idname):
-    return hasattr(bpy.types, idname)
+def _op(*paths):
+    """Il primo operatore che esiste in questa versione di Blender, es.
+    _op("wm.obj_export", "export_scene.obj"): i nomi cambiano tra versioni."""
+    for path in paths:
+        group, name = path.split(".")
+        try:
+            op = getattr(getattr(bpy.ops, group), name)
+            check = getattr(op, "get_rna_type", None)
+            if check is not None:
+                check()  # solleva se l'operatore non e' registrato
+        except Exception:
+            continue
+        return op
+    raise RuntimeError(f"operatore non disponibile in questa versione di Blender: {paths[0]}")
 
 
 # ----------------------------------------------------------------- comandi
@@ -386,14 +398,23 @@ def cmd_import_file(args):
         elif ext == ".fbx":
             bpy.ops.import_scene.fbx(filepath=path)
         elif ext == ".obj":
-            (bpy.ops.wm.obj_import if _has_op("WM_OT_obj_import") else bpy.ops.import_scene.obj)(filepath=path)
+            _op("wm.obj_import", "import_scene.obj")(filepath=path)
         elif ext == ".stl":
-            (bpy.ops.wm.stl_import if _has_op("WM_OT_stl_import") else bpy.ops.import_mesh.stl)(filepath=path)
+            _op("wm.stl_import", "import_mesh.stl")(filepath=path)
         elif ext in (".usd", ".usda", ".usdc", ".usdz"):
             bpy.ops.wm.usd_import(filepath=path)
         else:
             raise ValueError(f"formato non supportato: {ext} (validi: glb, gltf, fbx, obj, stl, usd)")
     return {"file": path, "imported": sorted(set(bpy.data.objects.keys()) - before)}
+
+
+def _export_mesh(new, old, path, sel):
+    """OBJ e STL: operatore nuovo se c'e', altrimenti quello delle versioni vecchie."""
+    try:
+        op = _op(new)
+    except RuntimeError:
+        return _op(old)(filepath=path, use_selection=sel)
+    return op(filepath=path, export_selected_objects=sel)
 
 
 def cmd_export_file(args):
@@ -409,15 +430,9 @@ def cmd_export_file(args):
         elif ext == ".fbx":
             bpy.ops.export_scene.fbx(filepath=path, use_selection=sel)
         elif ext == ".obj":
-            if _has_op("WM_OT_obj_export"):
-                bpy.ops.wm.obj_export(filepath=path, export_selected_objects=sel)
-            else:
-                bpy.ops.export_scene.obj(filepath=path, use_selection=sel)
+            _export_mesh("wm.obj_export", "export_scene.obj", path, sel)
         elif ext == ".stl":
-            if _has_op("WM_OT_stl_export"):
-                bpy.ops.wm.stl_export(filepath=path, export_selected_objects=sel)
-            else:
-                bpy.ops.export_mesh.stl(filepath=path, use_selection=sel)
+            _export_mesh("wm.stl_export", "export_mesh.stl", path, sel)
         elif ext in (".usd", ".usda", ".usdc"):
             bpy.ops.wm.usd_export(filepath=path, selected_objects_only=sel)
         else:
