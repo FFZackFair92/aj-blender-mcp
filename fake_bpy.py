@@ -23,8 +23,13 @@ class Store(dict):
         super().__init__()
         self.factory = factory
 
+    def __iter__(self):  # come Blender: si scorrono gli elementi, non i nomi
+        return iter(list(self.values()))
+
     def new(self, name, *args, **kwargs):
         base, n = name, 1
+        if name in self and name[-4:-3] == "." and name[-3:].isdigit():
+            base = name[:-4]  # come Blender: "Cubo.001" -> "Cubo.002"
         while name in self:
             name, n = f"{base}.{n:03d}", n + 1
         item = self.factory(name, *args, **kwargs)
@@ -33,16 +38,28 @@ class Store(dict):
 
     def remove(self, item, do_unlink=False):
         self.pop(item.name, None)
-        if isinstance(item, Object) and item in scene.objects:
-            scene.objects.remove(item)
+        if isinstance(item, Object):
+            for c in list(item.users_collection):
+                c.objects.unlink(item)
+
+    def load(self, path, check_existing=False):
+        return self.new(path.replace("\\", "/").split("/")[-1])
 
 
 class Datablock:
     kind = "EMPTY"
 
     def __init__(self, name, type=None):
-        self.name, self.subtype = name, type
+        self.name, self.type = name, type
         self.materials = []
+        self.users = 1
+        self.keys = []
+
+    def keyframe_insert(self, data_path, frame=None, index=-1):
+        self.keys.append((data_path, frame, index))
+
+    def copy(self):
+        return type(self)(self.name + ".001", *([self.type] if isinstance(self, Light) else []))
 
 
 class Mesh(Datablock):
@@ -52,13 +69,27 @@ class Mesh(Datablock):
         super().__init__(name)
         self.vertices, self.edges, self.polygons = [], [], []
 
+    def copy(self):
+        m = Mesh(self.name + ".001")
+        m.vertices, m.edges, m.polygons = list(self.vertices), list(self.edges), list(self.polygons)
+        return m
+
 
 class Light(Datablock):
     kind = "LIGHT"
 
+    def __init__(self, name, type="POINT"):
+        super().__init__(name, type)
+        self.energy, self.color, self.shadow_soft_size, self.size, self.spot_size = 1000.0, (1.0, 1.0, 1.0), 0.25, 1.0, 0.78
+
 
 class Camera(Datablock):
     kind = "CAMERA"
+
+    def __init__(self, name):
+        super().__init__(name)
+        self.lens = 50.0
+        self.dof = _t.SimpleNamespace(use_dof=False, focus_object=None, aperture_fstop=2.8)
 
 
 class Curve(Datablock):
@@ -85,6 +116,9 @@ class Modifier:
 
 
 class Modifiers(list):
+    def get(self, name):
+        return next((m for m in self if m.name == name), None)
+
     def new(self, name, kind):
         if kind not in ("SUBSURF", "BEVEL", "ARRAY", "MIRROR", "SOLIDIFY"):
             raise TypeError(f"enum {kind!r} not found")
@@ -93,15 +127,66 @@ class Modifiers(list):
         return mod
 
 
+class Constraint:
+    def __init__(self, kind):
+        self.type, self.name, self.influence = kind, kind.replace("_", " ").title(), 1.0
+        if kind != "LIMIT_ROTATION":
+            self.target = None
+        if kind == "TRACK_TO":
+            self.track_axis = "TRACK_NEGATIVE_Z"
+
+
+class Constraints(list):
+    def new(self, kind):
+        if kind not in ("TRACK_TO", "COPY_LOCATION", "LIMIT_ROTATION"):
+            raise TypeError(f"enum {kind!r} not found")
+        c = Constraint(kind)
+        self.append(c)
+        return c
+
+
+class Matrix:
+    def __init__(self, obj):
+        self.translation = tuple(obj.location)
+
+    def copy(self):
+        return self
+
+
 class Object:
     def __init__(self, name, data):
         self.name, self.data = name, data
         self.type = data.kind if data is not None else "EMPTY"
         self.location, self.rotation_euler, self.scale = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
         self.dimensions = (2.0, 2.0, 2.0)
-        self.parent, self.children, self.hide_viewport = None, [], False
+        self.parent, self.children, self.hide_viewport, self.hide_render = None, [], False, False
         self.modifiers = Modifiers()
+        self.constraints = Constraints()
         self.users_collection = []
+        self.selected = False
+        self.keys = []
+
+    @property
+    def matrix_world(self):
+        return Matrix(self)
+
+    @matrix_world.setter
+    def matrix_world(self, m):
+        self.location = m.translation
+
+    def copy(self):
+        new = data.objects.new(self.name, self.data)
+        new.location, new.rotation_euler, new.scale = self.location, self.rotation_euler, self.scale
+        return new
+
+    def select_set(self, value):
+        self.selected = bool(value)
+
+    def select_get(self):
+        return self.selected
+
+    def keyframe_insert(self, data_path, frame=None, index=-1):
+        self.keys.append((data_path, frame, index))
 
     @property
     def material_slots(self):
@@ -113,6 +198,15 @@ class Object:
 class Socket:
     default_value = None
 
+    def __init__(self, node=None):
+        self.node = node
+
+    @property
+    def links(self):
+        if scene.world is None:
+            return []
+        return [lk for lk in scene.world.node_tree.links if self in (lk.from_socket, lk.to_socket)]
+
 
 class Material:
     def __init__(self, name):
@@ -122,26 +216,138 @@ class Material:
         self.node_tree = _t.SimpleNamespace(nodes=[bsdf])
 
 
-class Links:
+class CollectionObjects(list):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+
     def link(self, obj):
-        scene.objects.append(obj)
-        obj.users_collection = [_t.SimpleNamespace(name="Scene Collection")]
+        if obj in self:
+            raise RuntimeError(f"Object '{obj.name}' already in collection '{self.owner.name}'")
+        self.append(obj)
+        obj.users_collection.append(self.owner)
+        if obj not in scene.objects:
+            scene.objects.append(obj)
+
+    def unlink(self, obj):
+        self.remove(obj)
+        obj.users_collection.remove(self.owner)
+        if not obj.users_collection and obj in scene.objects:
+            scene.objects.remove(obj)
 
 
+class Collection:
+    def __init__(self, name):
+        self.name, self.objects, self.children = name, CollectionObjects(self), _Children()
+
+
+class _Children(list):
+    def link(self, c):
+        self.append(c)
+
+
+class Render:
+    ENGINES = ("BLENDER_EEVEE_NEXT", "CYCLES", "BLENDER_WORKBENCH")
+
+    def __init__(self):
+        self._engine = "BLENDER_EEVEE_NEXT"
+        self.resolution_x, self.resolution_y, self.resolution_percentage = 1920, 1080, 100
+        self.filepath, self.fps, self.film_transparent, self.use_file_extension = "/tmp/", 24, False, True
+        self.image_settings = _t.SimpleNamespace(file_format="PNG")
+
+    @property
+    def engine(self):
+        return self._engine
+
+    @engine.setter
+    def engine(self, value):
+        if value not in self.ENGINES:
+            raise TypeError(f"enum {value!r} not found")
+        self._engine = value
+
+
+class Node:
+    def __init__(self, kind, inputs=(), outputs=()):
+        self.type = kind
+        self.inputs = {n: Socket(self) for n in inputs}
+        self.outputs = {n: Socket(self) for n in outputs}
+        self.image = None
+
+
+class NodeTree:
+    KINDS = {"ShaderNodeBackground": ("BACKGROUND", ("Color", "Strength"), ("Background",)),
+             "ShaderNodeOutputWorld": ("OUTPUT_WORLD", ("Surface",), ()),
+             "ShaderNodeTexEnvironment": ("TEX_ENVIRONMENT", (), ("Color",))}
+
+    def __init__(self):
+        self.nodes = _NodeList(self)
+        self.links = _Links()
+
+
+class _NodeList(list):
+    def __init__(self, tree):
+        super().__init__()
+        self.tree = tree
+
+    def new(self, bl_idname):
+        kind, ins, outs = NodeTree.KINDS[bl_idname]
+        n = Node(kind, ins, outs)
+        self.append(n)
+        return n
+
+
+class _Link:
+    def __init__(self, a, b):
+        self.from_socket, self.to_socket = a, b
+
+
+class _Links(list):
+    def new(self, a, b):
+        for old in list(b.links):
+            self.remove(old)
+        link = _Link(a, b)
+        self.append(link)
+        return link
+
+    def remove(self, link):
+        super().remove(link)
+
+
+class World:
+    def __init__(self, name):
+        self.name, self.use_nodes, self.node_tree = name, False, NodeTree()
+
+
+scene_collection = Collection("Scene Collection")
 scene = _t.SimpleNamespace(
-    name="Scene", objects=[], collection=_t.SimpleNamespace(objects=Links()), camera=None,
-    frame_start=1, frame_end=250, frame_current=1,
-    render=_t.SimpleNamespace(
-        engine="BLENDER_EEVEE", resolution_x=1920, resolution_y=1080, resolution_percentage=100,
-        filepath="/tmp/", image_settings=_t.SimpleNamespace(file_format="PNG")),
+    name="Scene", objects=[], collection=scene_collection, camera=None, world=None,
+    frame_start=1, frame_end=250, frame_current=1, render=Render(),
+    cycles=_t.SimpleNamespace(samples=4096), eevee=_t.SimpleNamespace(taa_render_samples=64),
 )
+
+
+def _frame_set(n):
+    scene.frame_current = n
+
+
+scene.frame_set = _frame_set
+
+
+class Image:
+    def __init__(self, name):
+        self.name, self.filepath, self.source, self.packed_file = name, "", "FILE", None
+
 
 data = _t.SimpleNamespace(
     objects=Store(Object), meshes=Store(Mesh), lights=Store(Light), cameras=Store(Camera),
-    curves=Store(Curve), materials=Store(Material), filepath="",
+    curves=Store(Curve), materials=Store(Material), collections=Store(Collection),
+    worlds=Store(World), images=Store(Image), filepath="",
 )
 
-_view = _t.SimpleNamespace(type="VIEW_3D", regions=[_t.SimpleNamespace(type="WINDOW")])
+_space = _t.SimpleNamespace(shading=_t.SimpleNamespace(type="SOLID"),
+                            region_3d=_t.SimpleNamespace(view_perspective="PERSP"))
+_view = _t.SimpleNamespace(type="VIEW_3D", regions=[_t.SimpleNamespace(type="WINDOW")],
+                           spaces=_t.SimpleNamespace(active=_space))
 _window = _t.SimpleNamespace(screen=_t.SimpleNamespace(areas=[_view]))
 main_thread = threading.current_thread()
 calls = []
@@ -157,8 +363,16 @@ def _temp_override(**kwargs):
     yield
 
 
+class _LayerObjects:
+    active = None
+
+    def __iter__(self):
+        return iter(list(scene.objects))
+
+
 context = _t.SimpleNamespace(
-    scene=scene, window_manager=_t.SimpleNamespace(windows=[_window]), temp_override=_temp_override)
+    scene=scene, window_manager=_t.SimpleNamespace(windows=[_window]), temp_override=_temp_override,
+    view_layer=_t.SimpleNamespace(objects=_LayerObjects()))
 
 
 def _opengl(write_still=False, view_context=True):
@@ -180,12 +394,41 @@ def _export(filepath, **kwargs):
         f.write(b"finto")
 
 
+def _render(write_still=False):
+    _main_only()
+    calls.append(("render", scene.render.resolution_percentage, scene.render.image_settings.file_format))
+    with open(scene.render.filepath, "wb") as f:
+        f.write(PNG_1X1)
+
+
+def _modifier_apply(modifier):
+    _main_only()
+    o = context.view_layer.objects.active
+    calls.append(("modifier_apply", modifier))
+    for ob in scene.objects:  # il finto non ha il contesto: cerca chi ha quel modificatore
+        mod = ob.modifiers.get(modifier)
+        if mod is not None:
+            ob.modifiers.remove(mod)
+            return
+    raise RuntimeError(f"modifier {modifier} not found ({o})")
+
+
+def _record(name):
+    def op(**kwargs):
+        _main_only()
+        calls.append((name, kwargs))
+    return op
+
+
 def _save_as(filepath):
     data.filepath = filepath
 
 
 ops = _t.SimpleNamespace(
-    render=_t.SimpleNamespace(opengl=_opengl),
+    render=_t.SimpleNamespace(opengl=_opengl, render=_render),
+    object=_t.SimpleNamespace(modifier_apply=_modifier_apply),
+    ed=_t.SimpleNamespace(undo=_record("undo"), redo=_record("redo"), undo_push=_record("undo_push")),
+    view3d=_t.SimpleNamespace(view_all=_record("view_all"), view_selected=_record("view_selected")),
     import_scene=_t.SimpleNamespace(gltf=_import, fbx=_import),
     export_scene=_t.SimpleNamespace(gltf=_export, fbx=_export),
     wm=_t.SimpleNamespace(obj_import=_import, obj_export=_export, stl_import=_import, stl_export=_export,
@@ -203,11 +446,22 @@ class _Timers:
 
 
 app = _t.SimpleNamespace(version_string="4.5.0 Finto", timers=_Timers)
+path = _t.SimpleNamespace(abspath=lambda p: p.replace("//", "/tmp/", 1) if p.startswith("//") else p)
 utils = _t.SimpleNamespace(register_class=lambda c: None, unregister_class=lambda c: None)
+
+
+def _prop(identifier, kind="INT", items=()):
+    return _t.SimpleNamespace(identifier=identifier, type=kind, name=identifier.title(), description=f"{identifier} finto",
+                              is_readonly=False, enum_items=[_t.SimpleNamespace(identifier=i) for i in items])
 
 
 class _Types(_t.SimpleNamespace):
     Panel = object
+    SubsurfModifier = _t.SimpleNamespace(bl_rna=_t.SimpleNamespace(
+        description="Subdivision surface finto",
+        properties=[_prop("rna_type", "POINTER"), _prop("levels"), _prop("render_levels"),
+                    _prop("subdivision_type", "ENUM", ("CATMULL_CLARK", "SIMPLE"))]))
+    BevelModifier = _t.SimpleNamespace(bl_rna=_t.SimpleNamespace(description="", properties=[_prop("width", "FLOAT")]))
 
 
 def run_main_loop(until, timeout=30):

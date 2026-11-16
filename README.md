@@ -14,7 +14,7 @@ Claude  <--stdio-->  blender_mcp.py  <--HTTP locale :9991-->  aj_blender_bridge.
 
 > **Stato:** provato dal vivo con Blender 5.2.1 LTS su Windows (`check_live.py`):
 > oggetti, materiali, modificatori, vista 3D, import ed export glb/obj/stl/fbx.
-> Non provati dal vivo: `save_file` e il formato usd. I test offline girano
+> Non provati dal vivo: `save_file`, il formato usd e i tool della 1.1 (vedi sotto). I test offline girano
 > contro un finto Blender (`fake_bpy.py`). Pensato per Blender 3.6 o successivo.
 
 ## 1. Installa uv
@@ -51,28 +51,63 @@ uv run --script check_live.py
 
 Crea oggetti di prova, verifica ogni funzione e li elimina.
 
-## Tool
+## Tool (40)
 
 **Avvio** — `open_blender(file, wait_seconds)`: apre Blender (o un .blend) e aspetta
 il ponte; se e' gia' aperto non ne apre un altro
 
 **Lettura** — `blender_status` · `scene_info(limit)` · `object_info(name)` ·
-`viewport_screenshot(max_size)`
+`find_objects(name, type, collection)` (name con `*` e `?`) · `viewport_screenshot(max_size)` ·
+`missing_files` (immagini, librerie, suoni e font che non si trovano piu')
 
 **Oggetti** — `create_object(kind, name, location, rotation, scale, size, text)` ·
-`transform_object(name, location, rotation, scale)` · `delete_objects(names)`
+`transform_object(name, location, rotation, scale)` · `duplicate_object(name, count, offset, linked)`
+(una fila di copie in un colpo) · `delete_objects(names)` · `set_parent(name, parent)` ·
+`select_objects(names, active)` · `set_visibility(names, viewport, render)`
 
 `kind`: cube, plane, sphere, ico_sphere, cylinder, cone, circle, monkey, empty,
 camera, text, point_light, sun, spot_light, area_light. Le rotazioni sono in gradi.
 
+**Collezioni** — `create_collection(name, parent)` · `move_to_collection(names, collection)`
+
 **Aspetto** — `set_material(object, name, color, metallic, roughness, emission_color, emission_strength)` ·
-`add_modifier(object, type, name, settings)`
+`add_modifier(object, type, name, settings)` · `apply_modifier` · `remove_modifier` ·
+`add_constraint(object, type, target, settings)` (TRACK_TO, COPY_LOCATION, CHILD_OF...)
+
+**Qualsiasi proprieta'** — `get_property(target, path)` · `set_property(target, path, value)`:
+target e' un oggetto, `scene`, `world` o `material:Nome`, `collection:Nome`...; path come
+`data.energy` o `modifiers.Bevel.segments` · `api_info(name)`: proprieta' e valori ammessi
+di un tipo di Blender (`SubsurfModifier`, `Light`...) o elenco con `*Modifier`
+
+**Animazione** — `set_keyframe(object, property, frame, value)` · `set_frame(current, start, end, fps)`
+
+**Camera, luci, ambiente** — `look_at(name, target | point)` · `set_camera(name, lens, active, dof_object, fstop)` ·
+`set_light(name, energy, color, size, spot_size)` · `set_world(color, strength, hdri)`
+
+**Render** — `set_render(engine, resolution, percentage, samples, fps, transparent)` ·
+`render_image(path)` (png, jpg, exr, tif...) · `render_preview(max_size)` (render vero in
+piccolo, come immagine) · `set_viewport(shading, frame, camera_view)`
 
 **File** — `import_file(path)` · `export_file(path, selected_only)` (glb, gltf,
 fbx, obj, stl, usd) · `save_file(path)`
 
+**Annulla e lotti** — ogni comando che cambia la scena e' un passo di annullamento
+(Ctrl+Z) · `undo(steps, redo)` · `batch(commands)`: piu' comandi in una chiamata, si
+ferma al primo errore, un solo passo di annullamento
+
 **Tutto il resto** — `run_python(code)`: codice Python dentro Blender, con `bpy`
 e `bmesh`. Quello che assegni a `result` torna indietro.
+
+**Prompt** — `costruisci_scena(descrizione)` · `controlla_file`
+
+> I tool aggiunti nella 1.1 (tutti tranne i primi 14) sono provati contro il finto
+> Blender; `check_live.py` ne prova dal vivo la maggior parte. `undo` dal ponte non e'
+> ancora stato provato su Blender vero. Dopo l'aggiornamento reinstalla l'add-on
+> (passo 2) e riavvia Blender.
+
+Niente servizi esterni di proposito: niente download da Poly Haven, Sketchfab o
+generatori 3D online come in altri MCP per Blender. Per gli HDRI usa file sul disco
+(`set_world(hdri=...)`).
 
 ## Sicurezza
 

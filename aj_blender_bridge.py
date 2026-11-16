@@ -16,6 +16,7 @@ Sicurezza: il ponte esegue codice Python in Blender, quindi ascolta solo su
 """
 import base64
 import contextlib
+import fnmatch
 import hmac
 import io
 import json
@@ -34,14 +35,14 @@ import bpy
 bl_info = {
     "name": "AJ MCP Bridge",
     "author": "AJ Consulting",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > AJ MCP",
     "description": "Ponte locale tra Blender e il server AJ Blender MCP",
     "category": "Interface",
 }
 
-BRIDGE_VERSION = "1.0.0"
+BRIDGE_VERSION = "1.1.0"
 PORT = int(os.environ.get("AJ_BLENDER_PORT", "9991"))
 TOKEN_FILE = os.path.join(os.path.expanduser("~"), ".aj-mcp", "blender.token")
 WAIT_SECONDS = 180
@@ -360,10 +361,11 @@ def cmd_run_python(args):
     return {"result": _plain(scope.get("result")), "stdout": out.getvalue()[-8000:]}
 
 
-def cmd_viewport_screenshot(args):
-    window, area, region = _view3d()
+def _render_png(max_size, opengl):
+    """Render (o vista OpenGL) ridotto a max_size sul lato lungo, in PNG;
+    le impostazioni di render tornano com'erano."""
     render = bpy.context.scene.render
-    max_size = max(64, min(int(args.get("max_size", 800)), 2000))
+    max_size = max(64, min(int(max_size), 2000))
     saved = (render.resolution_percentage, render.filepath, render.image_settings.file_format)
     path = os.path.join(tempfile.gettempdir(), f"aj_mcp_{os.getpid()}.png")
     try:
@@ -371,8 +373,13 @@ def cmd_viewport_screenshot(args):
         render.resolution_percentage = max(1, min(100, int(100 * max_size / longest)))
         render.image_settings.file_format = "PNG"
         render.filepath = path
-        with bpy.context.temp_override(window=window, area=area, region=region):
-            bpy.ops.render.opengl(write_still=True, view_context=True)
+        if opengl:
+            window, area, region = _view3d()
+            with bpy.context.temp_override(window=window, area=area, region=region):
+                bpy.ops.render.opengl(write_still=True, view_context=True)
+        else:
+            with bpy.context.temp_override(window=_window()):
+                bpy.ops.render.render(write_still=True)
         with open(path, "rb") as f:
             data = f.read()
     finally:
@@ -380,6 +387,10 @@ def cmd_viewport_screenshot(args):
         with contextlib.suppress(OSError):
             os.remove(path)
     return {"png_base64": base64.b64encode(data).decode("ascii")}
+
+
+def cmd_viewport_screenshot(args):
+    return _render_png(args.get("max_size", 800), opengl=True)
 
 
 def _ext(path):
@@ -455,7 +466,509 @@ def cmd_save_file(args):
     return {"file": bpy.data.filepath}
 
 
+# ------------------------------------------------------- comandi aggiunti (1.1)
+def _coll(name):
+    c = bpy.data.collections.get(name)
+    if c is None:
+        raise ValueError(f"collezione non trovata: {name}")
+    return c
+
+
+def cmd_find_objects(args):
+    pattern = (args.get("name") or "*").lower()
+    kind = (args.get("type") or "").upper()
+    coll = args.get("collection")
+    limit = int(args.get("limit", 200))
+    hits = [o for o in bpy.context.scene.objects
+            if fnmatch.fnmatchcase(o.name.lower(), pattern)
+            and (not kind or o.type == kind)
+            and (not coll or coll in [c.name for c in o.users_collection])]
+    return {"count": len(hits), "truncated": len(hits) > limit,
+            "objects": [{"name": o.name, "type": o.type, "location": _vec(o.location)} for o in hits[:limit]]}
+
+
+def cmd_duplicate_object(args):
+    src = _obj(args["name"])
+    count = max(1, min(int(args.get("count", 1)), 200))
+    offset = _three(args.get("offset", 0), "offset")
+    linked = bool(args.get("linked", False))
+    colls = list(src.users_collection) or [bpy.context.scene.collection]
+    made = []
+    for i in range(1, count + 1):
+        new = src.copy()
+        if src.data is not None and not linked:
+            new.data = src.data.copy()
+        for c in colls:
+            c.objects.link(new)
+        new.location = tuple(src.location[k] + offset[k] * i for k in range(3))
+        made.append(new.name)
+    return {"source": src.name, "created": made, "linked": linked}
+
+
+def cmd_set_parent(args):
+    child = _obj(args["name"])
+    parent = _obj(args["parent"]) if args.get("parent") else None
+    if parent is not None and (parent == child or child in _ancestors(parent)):
+        raise ValueError(f"{parent.name} non puo' essere genitore di {child.name} (ciclo)")
+    world = child.matrix_world.copy()
+    child.parent = parent
+    if args.get("keep_transform", True):
+        child.matrix_world = world
+    return {"name": child.name, "parent": parent.name if parent else None, "location": _vec(child.location)}
+
+
+def _ancestors(o):
+    out = []
+    while o.parent is not None:
+        o = o.parent
+        out.append(o)
+    return out
+
+
+def cmd_select_objects(args):
+    objs = [_obj(n) for n in (args.get("names") or [])]  # validati prima di cambiare la selezione
+    layer = bpy.context.view_layer
+    if not args.get("extend"):
+        for o in layer.objects:
+            o.select_set(False)
+    for o in objs:
+        o.select_set(True)
+    active = args.get("active") or (objs[0].name if objs else None)
+    if active:
+        layer.objects.active = _obj(active)
+    return {"selected": [o.name for o in layer.objects if o.select_get()],
+            "active": layer.objects.active.name if layer.objects.active else None}
+
+
+def cmd_set_visibility(args):
+    objs = [_obj(n) for n in args["names"]]
+    for o in objs:
+        if args.get("viewport") is not None:
+            o.hide_viewport = not bool(args["viewport"])
+        if args.get("render") is not None:
+            o.hide_render = not bool(args["render"])
+    return {"objects": [{"name": o.name, "viewport": not o.hide_viewport, "render": not o.hide_render}
+                        for o in objs]}
+
+
+def cmd_create_collection(args):
+    name = str(args["name"])
+    parent = _coll(args["parent"]) if args.get("parent") else bpy.context.scene.collection
+    c = bpy.data.collections.get(name)
+    if c is None:
+        c = bpy.data.collections.new(name)
+        parent.children.link(c)
+        return {"collection": c.name, "created": True}
+    return {"collection": c.name, "created": False}
+
+
+def cmd_move_to_collection(args):
+    objs = [_obj(n) for n in args["names"]]
+    target = bpy.data.collections.get(args["collection"])
+    if target is None:
+        if not args.get("create", True):
+            raise ValueError(f"collezione non trovata: {args['collection']}")
+        target = bpy.data.collections.new(args["collection"])
+        bpy.context.scene.collection.children.link(target)
+    for o in objs:
+        if target not in o.users_collection:
+            target.objects.link(o)
+        if not args.get("keep_others"):
+            for c in list(o.users_collection):
+                if c != target:
+                    c.objects.unlink(o)
+    return {"collection": target.name, "moved": [o.name for o in objs]}
+
+
+def _modifier(o, name):
+    mod = o.modifiers.get(name)
+    if mod is None:
+        raise ValueError(f"{o.name} non ha il modificatore {name} (ha: {[m.name for m in o.modifiers]})")
+    return mod
+
+
+def cmd_apply_modifier(args):
+    o = _obj(args["object"])
+    if o.type != "MESH":
+        raise ValueError(f"{o.name} ({o.type}): applico modificatori solo alle mesh")
+    mod = _modifier(o, args["modifier"])
+    if o.data.users > 1:
+        raise ValueError(f"la mesh di {o.name} e' condivisa con altri oggetti: duplicala prima")
+    with bpy.context.temp_override(window=_window(), object=o, active_object=o, selected_objects=[o]):
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+    return {"object": o.name, "applied": args["modifier"], "modifiers": [m.name for m in o.modifiers]}
+
+
+def cmd_remove_modifier(args):
+    o = _obj(args["object"])
+    o.modifiers.remove(_modifier(o, args["modifier"]))
+    return {"object": o.name, "modifiers": [m.name for m in o.modifiers]}
+
+
+def cmd_add_constraint(args):
+    o = _obj(args["object"])
+    kind = str(args["type"]).upper()
+    target = _obj(args["target"]) if args.get("target") else None
+    c = o.constraints.new(kind)
+    try:
+        if target is not None:
+            if not hasattr(c, "target"):
+                raise ValueError(f"il vincolo {kind} non ha un target")
+            c.target = target
+        for key, value in (args.get("settings") or {}).items():
+            if key.startswith("_") or not hasattr(c, key):
+                raise ValueError(f"il vincolo {kind} non ha l'impostazione '{key}'")
+            setattr(c, key, value)
+    except Exception:
+        o.constraints.remove(c)
+        raise
+    return {"object": o.name, "constraint": c.name, "type": c.type}
+
+
+# --- proprieta' per percorso: "data.energy", "modifiers.Bevel.width" ...
+def _target(spec):
+    spec = str(spec)
+    if ":" in spec:
+        kind, name = spec.split(":", 1)
+        store = {"material": bpy.data.materials, "collection": bpy.data.collections,
+                 "object": bpy.data.objects, "light": bpy.data.lights,
+                 "camera": bpy.data.cameras, "mesh": bpy.data.meshes}.get(kind)
+        if store is None:
+            raise ValueError(f"tipo di bersaglio sconosciuto: {kind} (material, collection, object, light, camera, mesh)")
+        item = store.get(name)
+        if item is None:
+            raise ValueError(f"{kind} non trovato: {name}")
+        return item
+    if spec == "scene":
+        return bpy.context.scene
+    if spec == "world":
+        if bpy.context.scene.world is None:
+            raise ValueError("la scena non ha un world")
+        return bpy.context.scene.world
+    return _obj(spec)
+
+
+def _step(cur, part):
+    if part.startswith("_"):
+        raise ValueError(f"parte di percorso non consentita: {part}")
+    if hasattr(cur, part):
+        return getattr(cur, part)
+    getter = getattr(cur, "get", None)
+    if callable(getter):
+        found = getter(part)
+        if found is not None:
+            return found
+    if part.lstrip("-").isdigit():
+        return cur[int(part)]
+    raise ValueError(f"'{part}' non trovato in {getattr(cur, 'name', type(cur).__name__)}")
+
+
+def _resolve(root, path):
+    parts = [p for p in str(path).split(".") if p]
+    if not parts:
+        raise ValueError("percorso vuoto")
+    cur = root
+    for part in parts[:-1]:
+        cur = _step(cur, part)
+    last = parts[-1]
+    if last.startswith("_"):
+        raise ValueError(f"parte di percorso non consentita: {last}")
+    if not hasattr(cur, last):
+        raise ValueError(f"'{last}' non trovato in {getattr(cur, 'name', type(cur).__name__)}")
+    return cur, last
+
+
+def cmd_get_property(args):
+    owner, attr = _resolve(_target(args["target"]), args["path"])
+    return {"target": args["target"], "path": args["path"], "value": _plain(getattr(owner, attr))}
+
+
+def cmd_set_property(args):
+    owner, attr = _resolve(_target(args["target"]), args["path"])
+    setattr(owner, attr, args["value"])
+    return {"target": args["target"], "path": args["path"], "value": _plain(getattr(owner, attr))}
+
+
+# --- animazione
+def cmd_set_keyframe(args):
+    o = _obj(args["object"])
+    path = {"rotation": "rotation_euler"}.get(args.get("property", "location"), args.get("property", "location"))
+    scene = bpy.context.scene
+    frame = float(args["frame"]) if args.get("frame") is not None else float(scene.frame_current)
+    owner, attr = _resolve(o, path)
+    if args.get("value") is not None:
+        value = args["value"]
+        if attr == "rotation_euler":
+            value = tuple(math.radians(a) for a in _three(value, "rotation"))
+        setattr(owner, attr, value)
+    index = int(args.get("index", -1))
+    owner.keyframe_insert(data_path=attr, frame=frame, index=index)
+    return {"object": o.name, "path": path, "frame": frame, "value": _plain(getattr(owner, attr))}
+
+
+def cmd_set_frame(args):
+    scene = bpy.context.scene
+    if args.get("start") is not None:
+        scene.frame_start = int(args["start"])
+    if args.get("end") is not None:
+        scene.frame_end = int(args["end"])
+    if args.get("fps") is not None:
+        scene.render.fps = int(args["fps"])
+    if args.get("current") is not None:
+        scene.frame_set(int(args["current"]))
+    return {"current": scene.frame_current, "start": scene.frame_start, "end": scene.frame_end,
+            "fps": scene.render.fps}
+
+
+# --- camera e luci
+def cmd_look_at(args):
+    o = _obj(args["name"])
+    if args.get("target"):
+        point = tuple(_obj(args["target"]).matrix_world.translation)
+    elif args.get("point") is not None:
+        point = _three(args["point"], "point")
+    else:
+        raise ValueError("indica target (un oggetto) o point [x, y, z]")
+    dx, dy, dz = (point[k] - o.location[k] for k in range(3))
+    if abs(dx) + abs(dy) + abs(dz) < 1e-9:
+        raise ValueError("l'oggetto e' gia' nel punto da guardare")
+    # camere, luci spot e sun guardano lungo -Z locale
+    o.rotation_euler = (math.atan2(math.hypot(dx, dy), -dz), 0.0, math.atan2(dy, dx) - math.pi / 2)
+    return {"name": o.name, "rotation": _deg(o.rotation_euler)}
+
+
+def cmd_set_camera(args):
+    o = _obj(args["name"])
+    if o.type != "CAMERA":
+        raise ValueError(f"{o.name} non e' una camera ({o.type})")
+    if args.get("lens") is not None:
+        o.data.lens = float(args["lens"])
+    if args.get("dof_object"):
+        o.data.dof.use_dof = True
+        o.data.dof.focus_object = _obj(args["dof_object"])
+    if args.get("fstop") is not None:
+        o.data.dof.use_dof = True
+        o.data.dof.aperture_fstop = float(args["fstop"])
+    if args.get("active", True):
+        bpy.context.scene.camera = o
+    return {"name": o.name, "lens": o.data.lens, "active": bpy.context.scene.camera == o}
+
+
+def cmd_set_light(args):
+    o = _obj(args["name"])
+    if o.type != "LIGHT":
+        raise ValueError(f"{o.name} non e' una luce ({o.type})")
+    light = o.data
+    if args.get("energy") is not None:
+        light.energy = float(args["energy"])
+    if args.get("color") is not None:
+        light.color = _rgba(args["color"], "color")[:3]
+    if args.get("size") is not None:
+        setattr(light, "size" if light.type == "AREA" else "shadow_soft_size", float(args["size"]))
+    if args.get("spot_size") is not None:
+        if light.type != "SPOT":
+            raise ValueError("spot_size vale solo per le luci spot")
+        light.spot_size = math.radians(float(args["spot_size"]))
+    return {"name": o.name, "type": light.type, "energy": light.energy, "color": _vec(light.color)}
+
+
+def _node_of(tree, kind, bl_idname):
+    node = next((n for n in tree.nodes if n.type == kind), None)
+    return node or tree.nodes.new(bl_idname)
+
+
+def cmd_set_world(args):
+    scene = bpy.context.scene
+    if scene.world is None:
+        scene.world = bpy.data.worlds.new("World")
+    world = scene.world
+    world.use_nodes = True
+    tree = world.node_tree
+    bg = _node_of(tree, "BACKGROUND", "ShaderNodeBackground")
+    out = _node_of(tree, "OUTPUT_WORLD", "ShaderNodeOutputWorld")
+    if not bg.outputs["Background"].links:
+        tree.links.new(bg.outputs["Background"], out.inputs["Surface"])
+    if args.get("hdri"):
+        path = os.path.abspath(os.path.expanduser(args["hdri"]))
+        if not os.path.isfile(path):
+            raise ValueError(f"file non trovato: {path}")
+        env = _node_of(tree, "TEX_ENVIRONMENT", "ShaderNodeTexEnvironment")
+        env.image = bpy.data.images.load(path, check_existing=True)
+        tree.links.new(env.outputs["Color"], bg.inputs["Color"])
+    elif args.get("color") is not None:
+        for link in list(bg.inputs["Color"].links):
+            tree.links.remove(link)
+        bg.inputs["Color"].default_value = _rgba(args["color"], "color")
+    if args.get("strength") is not None:
+        bg.inputs["Strength"].default_value = float(args["strength"])
+    return {"world": world.name, "hdri": args.get("hdri"), "strength": bg.inputs["Strength"].default_value}
+
+
+# --- render
+FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".exr": "OPEN_EXR", ".tif": "TIFF",
+           ".tiff": "TIFF", ".bmp": "BMP", ".webp": "WEBP"}
+ENGINES = {"eevee": ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"), "cycles": ("CYCLES",),
+           "workbench": ("BLENDER_WORKBENCH",)}
+
+
+def cmd_set_render(args):
+    scene = bpy.context.scene
+    render = scene.render
+    if args.get("engine"):
+        wanted = ENGINES.get(str(args["engine"]).lower(), (str(args["engine"]).upper(),))
+        for name in wanted:
+            try:
+                render.engine = name
+                break
+            except TypeError:
+                continue
+        else:
+            raise ValueError(f"motore non disponibile: {args['engine']} (eevee, cycles, workbench)")
+    if args.get("resolution") is not None:
+        w, h = (int(x) for x in args["resolution"])
+        render.resolution_x, render.resolution_y = w, h
+    if args.get("percentage") is not None:
+        render.resolution_percentage = max(1, min(int(args["percentage"]), 100))
+    if args.get("fps") is not None:
+        render.fps = int(args["fps"])
+    if args.get("samples") is not None:
+        samples = int(args["samples"])
+        if render.engine == "CYCLES":
+            scene.cycles.samples = samples
+        elif hasattr(scene, "eevee"):
+            scene.eevee.taa_render_samples = samples
+    if args.get("transparent") is not None:
+        render.film_transparent = bool(args["transparent"])
+    return {"engine": render.engine, "resolution": [render.resolution_x, render.resolution_y],
+            "percentage": render.resolution_percentage, "fps": render.fps,
+            "transparent": bool(render.film_transparent)}
+
+
+def cmd_render_image(args):
+    path = os.path.abspath(os.path.expanduser(args["path"]))
+    fmt = FORMATS.get(_ext(path))
+    if fmt is None:
+        raise ValueError(f"estensione non supportata: {_ext(path)} (validi: {', '.join(FORMATS)})")
+    if not os.path.isdir(os.path.dirname(path)):
+        raise ValueError(f"cartella non trovata: {os.path.dirname(path)}")
+    render = bpy.context.scene.render
+    saved = (render.filepath, render.image_settings.file_format, render.use_file_extension)
+    try:
+        render.filepath, render.image_settings.file_format, render.use_file_extension = path, fmt, False
+        with bpy.context.temp_override(window=_window()):
+            bpy.ops.render.render(write_still=True)
+    finally:
+        render.filepath, render.image_settings.file_format, render.use_file_extension = saved
+    return {"file": path, "bytes": os.path.getsize(path) if os.path.exists(path) else 0,
+            "resolution": [render.resolution_x * render.resolution_percentage // 100,
+                           render.resolution_y * render.resolution_percentage // 100]}
+
+
+def cmd_render_preview(args):
+    return _render_png(args.get("max_size", 640), opengl=False)
+
+
+def cmd_set_viewport(args):
+    window, area, region = _view3d()
+    space = area.spaces.active
+    if args.get("shading"):
+        kind = str(args["shading"]).upper()
+        if kind not in ("WIREFRAME", "SOLID", "MATERIAL", "RENDERED"):
+            raise ValueError("shading: wireframe, solid, material o rendered")
+        space.shading.type = kind
+    frame = args.get("frame")
+    if frame:
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            if frame == "all":
+                bpy.ops.view3d.view_all()
+            else:
+                cmd_select_objects({"names": [frame]})
+                bpy.ops.view3d.view_selected()
+    if args.get("camera_view"):
+        if bpy.context.scene.camera is None:
+            raise ValueError("la scena non ha una camera attiva")
+        space.region_3d.view_perspective = "CAMERA"
+    return {"shading": space.shading.type, "framed": frame}
+
+
+# --- documentazione e controlli
+def cmd_api_info(args):
+    """Proprieta' di un tipo RNA di Blender (SubsurfModifier, Light, Object...),
+    o elenco dei tipi che corrispondono a un modello con * e ?."""
+    name = str(args["name"])
+    if "*" in name or "?" in name:
+        names = sorted(n for n in dir(bpy.types) if fnmatch.fnmatchcase(n.lower(), name.lower()))
+        return {"pattern": name, "count": len(names), "types": names[:300]}
+    cls = getattr(bpy.types, name, None)
+    if cls is None or not hasattr(cls, "bl_rna"):
+        raise ValueError(f"tipo sconosciuto: {name} (prova con un modello, es. '*Modifier')")
+    rna = cls.bl_rna
+    needle = (args.get("filter") or "").lower()
+    props = []
+    for p in rna.properties:
+        if p.identifier == "rna_type" or (needle and needle not in p.identifier.lower()):
+            continue
+        item = {"name": p.identifier, "type": p.type, "label": p.name,
+                "description": (p.description or "")[:200], "read_only": bool(p.is_readonly)}
+        if p.type == "ENUM":
+            item["items"] = [e.identifier for e in p.enum_items][:60]
+        props.append(item)
+    return {"type": name, "description": rna.description, "properties": props}
+
+
+def cmd_missing_files(args):
+    missing = []
+    for kind in ("images", "libraries", "sounds", "movieclips", "fonts", "volumes", "cache_files"):
+        for item in getattr(bpy.data, kind, ()):
+            raw = getattr(item, "filepath", "") or ""
+            if not raw or raw.startswith("<") or getattr(item, "packed_file", None) is not None:
+                continue
+            if getattr(item, "source", "FILE") not in ("FILE", "SEQUENCE", "MOVIE", "TILED"):
+                continue
+            full = bpy.path.abspath(raw)
+            if not os.path.exists(full):
+                missing.append({"kind": kind, "name": item.name, "path": full})
+    return {"count": len(missing), "missing": missing}
+
+
+def cmd_undo(args):
+    steps = max(1, min(int(args.get("steps", 1)), 50))
+    op = bpy.ops.ed.redo if args.get("redo") else bpy.ops.ed.undo
+    with bpy.context.temp_override(window=_window()):
+        for _ in range(steps):
+            op()
+    return {"action": "redo" if args.get("redo") else "undo", "steps": steps}
+
+
+def cmd_batch(args):
+    """Piu' comandi in fila; si ferma al primo errore."""
+    results = []
+    for i, step in enumerate(args.get("commands") or []):
+        name = step.get("cmd")
+        if name in ("batch", "undo"):
+            raise ValueError(f"passo {i}: {name} non si puo' usare dentro batch")
+        fn = COMMANDS.get(name)
+        if fn is None:
+            raise ValueError(f"passo {i}: comando sconosciuto {name}")
+        try:
+            results.append(fn(step.get("args") or {}))
+        except Exception as e:
+            raise RuntimeError(f"passo {i} ({name}) fallito dopo {i} riusciti: {type(e).__name__}: {e}") from None
+    return {"steps": len(results), "results": results}
+
+
 COMMANDS = {name[4:]: fn for name, fn in list(globals().items()) if name.startswith("cmd_")}
+
+
+READ_ONLY = {"status", "scene_info", "object_info", "viewport_screenshot", "find_objects",
+             "get_property", "api_info", "missing_files", "render_preview", "undo", "export_file",
+             "render_image", "save_file"}
+
+
+def _undo_push(name):
+    """Un passo di annullamento per ogni comando che cambia la scena (Ctrl+Z)."""
+    with contextlib.suppress(Exception), bpy.context.temp_override(window=_window()):
+        bpy.ops.ed.undo_push(message=f"AJ MCP {name}")
 
 
 # ------------------------------------------------- coda e thread principale
@@ -464,7 +977,10 @@ def _run(body):
         fn = COMMANDS.get(body.get("cmd"))
         if fn is None:
             raise ValueError(f"comando sconosciuto: {body.get('cmd')}")
-        return {"ok": True, "result": fn(body.get("args") or {})}
+        result = fn(body.get("args") or {})
+        if body.get("cmd") not in READ_ONLY:
+            _undo_push(body.get("cmd"))
+        return {"ok": True, "result": result}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}",
                 "trace": traceback.format_exc()[-2000:]}

@@ -250,5 +250,233 @@ def save_file(path: str = "") -> dict:
     return call("save_file", path=path or None)
 
 
+# ------------------------------------------------------- oggetti e scena (1.1)
+@mcp.tool()
+def find_objects(name: str = "*", type: str = "", collection: str = "", limit: int = 200) -> dict:
+    """Cerca oggetti nella scena. name accetta * e ? ("Cubo*"); type e' il tipo
+    di Blender (MESH, LIGHT, CAMERA, EMPTY, CURVE, FONT...); collection filtra
+    per collezione."""
+    return call("find_objects", name=name, type=type or None, collection=collection or None, limit=limit)
+
+
+@mcp.tool()
+def duplicate_object(name: str, count: int = 1, offset: list[float] | None = None,
+                     linked: bool = False) -> dict:
+    """Duplica un oggetto `count` volte, spostando ogni copia di `offset`
+    [x, y, z] rispetto alla precedente (una fila, una scala...). linked=true
+    condivide la mesh con l'originale."""
+    return call("duplicate_object", name=name, count=count, offset=offset, linked=linked)
+
+
+@mcp.tool()
+def set_parent(name: str, parent: str = "", keep_transform: bool = True) -> dict:
+    """Rende `parent` genitore di `name` (senza parent lo stacca). Con
+    keep_transform l'oggetto resta dov'e' nel mondo."""
+    return call("set_parent", name=name, parent=parent or None, keep_transform=keep_transform)
+
+
+@mcp.tool()
+def select_objects(names: list[str], active: str = "", extend: bool = False) -> dict:
+    """Seleziona gli oggetti indicati (e ne rende attivo uno). Utile prima di
+    export_file con selected_only. extend=true aggiunge alla selezione."""
+    return call("select_objects", names=names, active=active or None, extend=extend)
+
+
+@mcp.tool()
+def set_visibility(names: list[str], viewport: bool | None = None, render: bool | None = None) -> dict:
+    """Mostra o nasconde oggetti nella vista 3D e/o nel render."""
+    return call("set_visibility", names=names, viewport=viewport, render=render)
+
+
+@mcp.tool()
+def create_collection(name: str, parent: str = "") -> dict:
+    """Crea una collezione (dentro `parent`, o nella scena). Se esiste gia' la lascia com'e'."""
+    return call("create_collection", name=name, parent=parent or None)
+
+
+@mcp.tool()
+def move_to_collection(names: list[str], collection: str, keep_others: bool = False,
+                       create: bool = True) -> dict:
+    """Sposta oggetti in una collezione (creandola se manca). keep_others=true li
+    lascia anche nelle collezioni dove sono gia'."""
+    return call("move_to_collection", names=names, collection=collection,
+                keep_others=keep_others, create=create)
+
+
+# ------------------------------------------------- modificatori e vincoli (1.1)
+@mcp.tool()
+def apply_modifier(object: str, modifier: str) -> dict:
+    """Applica un modificatore a una mesh (diventa geometria vera)."""
+    return call("apply_modifier", object=object, modifier=modifier)
+
+
+@mcp.tool()
+def remove_modifier(object: str, modifier: str) -> dict:
+    """Toglie un modificatore senza applicarlo."""
+    return call("remove_modifier", object=object, modifier=modifier)
+
+
+@mcp.tool()
+def add_constraint(object: str, type: str, target: str = "", settings: dict[str, Any] | None = None) -> dict:
+    """Aggiunge un vincolo: TRACK_TO, COPY_LOCATION, COPY_ROTATION, CHILD_OF,
+    FOLLOW_PATH, LIMIT_DISTANCE, DAMPED_TRACK... con `target` (un oggetto) e
+    altre impostazioni in settings."""
+    return call("add_constraint", object=object, type=type, target=target or None, settings=settings)
+
+
+# ------------------------------------------------------ proprieta' (1.1)
+@mcp.tool()
+def get_property(target: str, path: str) -> dict:
+    """Legge una proprieta' qualsiasi per percorso. target: nome di un oggetto,
+    "scene", "world" o "material:Nome" / "collection:Nome" / "light:Nome" /
+    "camera:Nome" / "mesh:Nome". path: "data.energy",
+    "modifiers.Bevel.width", "render.fps" (con target "scene")."""
+    return call("get_property", target=target, path=path)
+
+
+@mcp.tool()
+def set_property(target: str, path: str, value: Any) -> dict:
+    """Scrive una proprieta' qualsiasi per percorso (vedi get_property), es.
+    target="Cubo", path="modifiers.Bevel.segments", value=4. Ritorna il valore riletto.
+    Per sapere quali proprieta' esistono: api_info."""
+    return call("set_property", target=target, path=path, value=value)
+
+
+@mcp.tool()
+def api_info(name: str, filter: str = "") -> dict:
+    """Documentazione dell'API di Blender: proprieta' di un tipo (es.
+    "SubsurfModifier", "Light", "Object") con tipo, descrizione e valori
+    ammessi. Con * e ? elenca i tipi: "*Modifier", "*Constraint"."""
+    return call("api_info", name=name, filter=filter or None)
+
+
+# ------------------------------------------------------------ animazione (1.1)
+@mcp.tool()
+def set_keyframe(object: str, property: str = "location", frame: float | None = None,
+                 value: Any = None, index: int = -1) -> dict:
+    """Inserisce un fotogramma chiave. property: location, rotation (gradi),
+    scale o un percorso come "data.energy". Con value imposta prima il valore;
+    senza frame usa il fotogramma corrente; index sceglie un solo asse (0, 1, 2)."""
+    return call("set_keyframe", object=object, property=property, frame=frame, value=value, index=index)
+
+
+@mcp.tool()
+def set_frame(current: int | None = None, start: int | None = None, end: int | None = None,
+              fps: int | None = None) -> dict:
+    """Fotogramma corrente, intervallo dell'animazione e fps della scena."""
+    return call("set_frame", current=current, start=start, end=end, fps=fps)
+
+
+# ------------------------------------------------------- camera e luci (1.1)
+@mcp.tool()
+def look_at(name: str, target: str = "", point: list[float] | None = None) -> dict:
+    """Orienta una camera o una luce verso un oggetto (`target`) o un punto
+    [x, y, z]."""
+    return call("look_at", name=name, target=target or None, point=point)
+
+
+@mcp.tool()
+def set_camera(name: str, lens: float | None = None, active: bool = True,
+               dof_object: str = "", fstop: float | None = None) -> dict:
+    """Imposta una camera: focale in mm, camera attiva della scena,
+    profondita' di campo (oggetto a fuoco e apertura f)."""
+    return call("set_camera", name=name, lens=lens, active=active, dof_object=dof_object or None, fstop=fstop)
+
+
+@mcp.tool()
+def set_light(name: str, energy: float | None = None, color: list[float] | None = None,
+              size: float | None = None, spot_size: float | None = None) -> dict:
+    """Imposta una luce: potenza (W, per il sole W/m2), colore [r, g, b],
+    dimensione (morbidezza delle ombre) e apertura dello spot in gradi."""
+    return call("set_light", name=name, energy=energy, color=color, size=size, spot_size=spot_size)
+
+
+@mcp.tool()
+def set_world(color: list[float] | None = None, strength: float | None = None, hdri: str = "") -> dict:
+    """Sfondo e luce ambiente: un colore [r, g, b] oppure un'immagine HDRI dal
+    disco (.hdr, .exr), con la sua intensita'."""
+    return call("set_world", color=color, strength=strength, hdri=hdri or None)
+
+
+# --------------------------------------------------------------- render (1.1)
+@mcp.tool()
+def set_render(engine: str = "", resolution: list[int] | None = None, percentage: int | None = None,
+               samples: int | None = None, fps: int | None = None,
+               transparent: bool | None = None) -> dict:
+    """Impostazioni di render: motore (eevee, cycles, workbench), risoluzione
+    [larghezza, altezza], percentuale, campioni, fps, sfondo trasparente."""
+    return call("set_render", engine=engine or None, resolution=resolution, percentage=percentage,
+                samples=samples, fps=fps, transparent=transparent)
+
+
+@mcp.tool()
+def render_image(path: str) -> dict:
+    """Renderizza il fotogramma corrente con le impostazioni della scena e lo
+    salva (png, jpg, exr, tif, bmp, webp, dall'estensione). Puo' richiedere
+    tempo: per un controllo veloce usa render_preview."""
+    return call("render_image", path=path)
+
+
+@mcp.tool()
+def render_preview(max_size: int = 640) -> Image:
+    """Render vero (luci, materiali) in piccolo, per vedere il risultato finale.
+    Piu' lento di viewport_screenshot."""
+    r = call("render_preview", max_size=max_size)
+    return Image(data=base64.b64decode(r["png_base64"]), format="png")
+
+
+@mcp.tool()
+def set_viewport(shading: str = "", frame: str = "", camera_view: bool = False) -> dict:
+    """Vista 3D: shading (wireframe, solid, material, rendered), inquadra un
+    oggetto (frame="Nome") o tutto (frame="all"), guarda dalla camera."""
+    return call("set_viewport", shading=shading or None, frame=frame or None, camera_view=camera_view or None)
+
+
+# ------------------------------------------------------- controlli (1.1)
+@mcp.tool()
+def missing_files() -> dict:
+    """File esterni (immagini, librerie, suoni, video, font) che il .blend usa
+    ma che non si trovano piu' sul disco."""
+    return call("missing_files")
+
+
+@mcp.tool()
+def undo(steps: int = 1, redo: bool = False) -> dict:
+    """Annulla (o ripete) gli ultimi passi. Ogni comando di questo server che
+    cambia la scena e' un passo, batch compreso."""
+    return call("undo", steps=steps, redo=redo or None)
+
+
+@mcp.tool()
+def batch(commands: list[dict[str, Any]]) -> dict:
+    """Esegue piu' comandi in una sola chiamata, es.
+    [{"cmd": "create_object", "args": {"kind": "cube", "name": "A"}},
+     {"cmd": "set_material", "args": {"object": "A", "color": [1, 0, 0]}}].
+    I nomi sono quelli dei tool (blender_status -> status). Si ferma al primo
+    errore; un solo undo annulla tutto."""
+    return call("batch", commands=commands)
+
+
+# -------------------------------------------------------------- prompt (1.1)
+@mcp.prompt()
+def costruisci_scena(descrizione: str) -> str:
+    """Costruzione guidata di una scena dalla descrizione."""
+    return (f"Costruisci in Blender questa scena: {descrizione}\n"
+            "Procedi cosi': scene_info per vedere cosa c'e'; create_object e duplicate_object per la "
+            "geometria; set_material; luci con create_object + set_light + look_at; una camera con "
+            "set_camera e look_at; set_world per l'ambiente. Usa batch per i gruppi di comandi. "
+            "Controlla con viewport_screenshot dopo ogni gruppo e con render_preview alla fine. "
+            "Se sbagli, undo.")
+
+
+@mcp.prompt()
+def controlla_file() -> str:
+    """Controllo di un .blend prima di consegnarlo."""
+    return ("Controlla il file aperto in Blender: blender_status e scene_info per il quadro; "
+            "missing_files per i file esterni mancanti; find_objects per oggetti nascosti o senza "
+            "materiale; set_render per motore e risoluzione. Riassumi i problemi in ordine di gravita' "
+            "e proponi le correzioni prima di applicarle.")
+
+
 if __name__ == "__main__":
     mcp.run()
