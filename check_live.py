@@ -7,7 +7,7 @@ elimina insieme al materiale di prova: il resto della scena non viene toccato.
 """
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2,<2"]
+# dependencies = ["mcp>=1.10,<3"]
 # ///
 import sys
 import tempfile
@@ -69,6 +69,30 @@ try:
     assert r["steps"] == 2, r
     print(f"ricerca, duplica, collezioni, proprieta', animazione, vincoli, luci, batch: ok "
           f"(file mancanti: {m.missing_files()['count']})")
+    # --- 1.2 (niente restore: riaprirebbe il file)
+    cp = m.checkpoint("save", P + "cp")
+    assert any(c["name"] == P + "cp" for c in m.checkpoint()["checkpoints"]), cp
+    m.checkpoint("delete", P + "cp")
+    plane = P + "plane"
+    r = m.mesh_ops(plane, "subdivide", {"cuts": 2})
+    assert r["after"]["faces"] == 9, r
+    m.mesh_ops(plane, "shade_smooth")
+    assert m.uv_unwrap(plane)["uv_layers"], "nessuna UV creata"
+    b = m.boolean(cube, P + "cylinder", "difference")
+    assert b["modifier"] in [x["name"] for x in m.object_info(cube)["modifiers"]], b
+    m.run_python(f"o = bpy.data.objects['{P}cylinder']; o.hide_viewport = o.hide_render = False")
+    a = m.animate(P + "monkey", [{"frame": 1, "value": [0, 0, 0]}, {"frame": 30, "value": [0, 0, 2]}],
+                  interpolation="linear", cycles=True)
+    assert a["curves"] == 3, a
+    mn = m.material_nodes(cube, inputs={"Alpha": 0.8})
+    assert mn["set"] == ["Alpha"], mn
+    m.rigid_body("add", [P + "cone"], mass=2)
+    m.rigid_body("remove", [P + "cone"])
+    st = m.scene_stats(top=3)
+    assert st["faces"] > 0 and st["heaviest"], st
+    assert m.view_object(cube).data[:8] == b"\x89PNG\r\n\x1a\n"
+    print("1.2 (checkpoint, mesh_ops, uv_unwrap, boolean, animate, material_nodes, rigid_body, scene_stats, view_object): ok")
+
     prev = m.render_preview(256)
     assert prev.data[:8] == b"\x89PNG\r\n\x1a\n", "il render di prova non e' un PNG"
     print(f"render_preview: ok ({len(prev.data)} byte)")

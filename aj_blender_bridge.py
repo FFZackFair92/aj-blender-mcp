@@ -35,14 +35,14 @@ import bpy
 bl_info = {
     "name": "AJ MCP Bridge",
     "author": "AJ Consulting",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > AJ MCP",
     "description": "Ponte locale tra Blender e il server AJ Blender MCP",
     "category": "Interface",
 }
 
-BRIDGE_VERSION = "1.1.0"
+BRIDGE_VERSION = "1.2.0"
 PORT = int(os.environ.get("AJ_BLENDER_PORT", "9991"))
 TOKEN_FILE = os.path.join(os.path.expanduser("~"), ".aj-mcp", "blender.token")
 WAIT_SECONDS = 180
@@ -957,12 +957,456 @@ def cmd_batch(args):
     return {"steps": len(results), "results": results}
 
 
+# ------------------------------------------------------- comandi aggiunti (1.2)
+CHECKPOINT_DIR = os.path.join(os.path.expanduser("~"), ".aj-mcp", "blender-checkpoints")
+
+
+def _cp_name(name):
+    clean = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(name or "")).strip("_")
+    if not clean:
+        raise ValueError("serve un nome per il checkpoint (lettere, numeri, - e _)")
+    return clean[:60]
+
+
+def _cp_list():
+    out = []
+    if os.path.isdir(CHECKPOINT_DIR):
+        for f in sorted(os.listdir(CHECKPOINT_DIR)):
+            if f.endswith(".blend"):
+                meta = {}
+                with contextlib.suppress(Exception), open(os.path.join(CHECKPOINT_DIR, f[:-6] + ".json"), encoding="utf-8") as fh:
+                    meta = json.load(fh)
+                out.append({"name": f[:-6], "bytes": os.path.getsize(os.path.join(CHECKPOINT_DIR, f)), **meta})
+    return out
+
+
+def cmd_checkpoint(args):
+    """Punti di ripristino dell'intera scena: save (copia del file, la scena aperta non cambia), list,
+    restore (riapre quella copia: tutto torna com'era), delete."""
+    action = args.get("action", "list")
+    if action == "list":
+        return {"folder": CHECKPOINT_DIR, "checkpoints": _cp_list()}
+    name = _cp_name(args.get("name"))
+    path = os.path.join(CHECKPOINT_DIR, name + ".blend")
+    if action == "save":
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        with bpy.context.temp_override(window=_window()):
+            bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)
+        import time as _time
+        meta = {"saved_at": _time.strftime("%Y-%m-%d %H:%M:%S"), "original_file": bpy.data.filepath or None,
+                "objects": len(bpy.context.scene.objects), "note": args.get("note") or ""}
+        with open(path[:-6] + ".json", "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False)
+        return {"saved": name, "file": path, **meta}
+    if not os.path.isfile(path):
+        raise ValueError(f"checkpoint non trovato: {name} (ci sono: {[c['name'] for c in _cp_list()]})")
+    if action == "delete":
+        for p in (path, path[:-6] + ".json"):
+            with contextlib.suppress(OSError):
+                os.remove(p)
+        return {"deleted": name}
+    if action == "restore":
+        meta = next((c for c in _cp_list() if c["name"] == name), {})
+
+        def _load():
+            with contextlib.suppress(Exception), bpy.context.temp_override(window=_window()):
+                bpy.ops.wm.open_mainfile(filepath=path)
+            return None
+
+        bpy.app.timers.register(_load, first_interval=0.3)  # dopo la risposta: l'apertura azzera il contesto
+        return {"restoring": name, "file": path, "original_file": meta.get("original_file"),
+                "note": "Blender riapre il checkpoint tra un attimo. Per tenerlo sul file originale: save_file(path=original_file)."}
+    raise ValueError("action: save | list | restore | delete")
+
+
+def cmd_save_copy(args):
+    """Copia del file attuale per il render in background (la scena aperta non cambia)."""
+    folder = os.path.join(tempfile.gettempdir(), "aj-mcp-render")
+    os.makedirs(folder, exist_ok=True)
+    import time as _time
+    path = os.path.join(folder, f"render_{int(_time.time() * 1000)}.blend")
+    with bpy.context.temp_override(window=_window()):
+        bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)
+    scene = bpy.context.scene
+    return {"file": path, "frames": [scene.frame_start, scene.frame_end], "engine": scene.render.engine,
+            "resolution": [scene.render.resolution_x, scene.render.resolution_y, scene.render.resolution_percentage]}
+
+
+def _mesh_obj(name):
+    o = _obj(name)
+    if o.type != "MESH":
+        raise ValueError(f"{o.name} e' {o.type}: serve una mesh")
+    return o
+
+
+def _counts(me):
+    return {"vertices": len(me.vertices), "edges": len(me.edges), "faces": len(me.polygons)}
+
+
+MESH_OPS = ("subdivide", "bevel", "triangulate", "merge_by_distance", "recalc_normals", "flip_normals",
+            "dissolve_limited", "inset", "shade_smooth", "shade_flat", "smooth_vertices")
+
+
+def cmd_mesh_ops(args):
+    """Operazioni sulla mesh senza modalita' modifica (bmesh): subdivide, bevel, triangulate, merge_by_distance,
+    recalc_normals, flip_normals, dissolve_limited, inset, smooth_vertices, shade_smooth, shade_flat."""
+    o = _mesh_obj(args["object"])
+    op = str(args["op"]).lower()
+    if op not in MESH_OPS:
+        raise ValueError(f"op: {', '.join(MESH_OPS)}")
+    s = args.get("settings") or {}
+    me = o.data
+    if me.users > 1:
+        raise ValueError(f"la mesh di {o.name} e' condivisa con altri oggetti: duplicala prima")
+    before = _counts(me)
+    if op in ("shade_smooth", "shade_flat"):
+        smooth = op == "shade_smooth"
+        for p in me.polygons:
+            p.use_smooth = smooth
+        if smooth and s.get("auto_angle") is not None:
+            with contextlib.suppress(Exception), bpy.context.temp_override(window=_window(), object=o, active_object=o, selected_objects=[o]):
+                bpy.ops.object.shade_auto_smooth(angle=math.radians(float(s["auto_angle"])))
+        return {"object": o.name, "op": op, **_counts(me)}
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(me)
+        ops = bmesh.ops
+        if op == "subdivide":
+            ops.subdivide_edges(bm, edges=bm.edges[:], cuts=int(s.get("cuts", 1)), use_grid_fill=True,
+                                smooth=float(s.get("smooth", 0.0)))
+        elif op == "bevel":
+            ops.bevel(bm, geom=bm.verts[:] + bm.edges[:], offset=float(s.get("width", 0.05)),
+                      segments=int(s.get("segments", 2)), affect="EDGES", profile=float(s.get("profile", 0.5)))
+        elif op == "triangulate":
+            ops.triangulate(bm, faces=bm.faces[:])
+        elif op == "merge_by_distance":
+            ops.remove_doubles(bm, verts=bm.verts[:], dist=float(s.get("distance", 0.0001)))
+        elif op == "recalc_normals":
+            ops.recalc_face_normals(bm, faces=bm.faces[:])
+        elif op == "flip_normals":
+            ops.reverse_faces(bm, faces=bm.faces[:])
+        elif op == "dissolve_limited":
+            ops.dissolve_limit(bm, angle_limit=math.radians(float(s.get("angle", 5))), verts=bm.verts[:], edges=bm.edges[:])
+        elif op == "inset":
+            ops.inset_region(bm, faces=bm.faces[:], thickness=float(s.get("thickness", 0.05)), depth=float(s.get("depth", 0.0)))
+        elif op == "smooth_vertices":
+            for _ in range(max(1, min(int(s.get("repeat", 1)), 50))):
+                ops.smooth_vert(bm, verts=bm.verts[:], factor=float(s.get("factor", 0.5)),
+                                use_axis_x=True, use_axis_y=True, use_axis_z=True)
+        bm.to_mesh(me)
+    finally:
+        bm.free()
+    with contextlib.suppress(Exception):
+        me.update()
+    return {"object": o.name, "op": op, "before": before, "after": _counts(me)}
+
+
+UV_METHODS = {"smart": "smart_project", "unwrap": "unwrap", "cube": "cube_project", "sphere": "sphere_project",
+              "cylinder": "cylinder_project", "lightmap": "lightmap_pack"}
+
+
+def cmd_uv_unwrap(args):
+    """UV di una mesh in un colpo: smart (Smart UV Project), unwrap (sulle cuciture), cube, sphere, cylinder, lightmap."""
+    o = _mesh_obj(args["object"])
+    method = str(args.get("method", "smart")).lower()
+    if method not in UV_METHODS:
+        raise ValueError(f"method: {', '.join(UV_METHODS)}")
+    window, area, region = _view3d()
+    layer = bpy.context.view_layer
+    for ob in layer.objects:
+        ob.select_set(False)
+    o.select_set(True)
+    layer.objects.active = o
+    kwargs = {}
+    if method == "smart":
+        kwargs = {"angle_limit": math.radians(float(args.get("angle", 66))), "island_margin": float(args.get("margin", 0.02))}
+    elif method == "unwrap":
+        kwargs = {"margin": float(args.get("margin", 0.001))}
+    elif method == "cube":
+        kwargs = {"cube_size": float(args.get("size", 1.0))}
+    with bpy.context.temp_override(window=window, area=area, region=region, object=o, active_object=o):
+        bpy.ops.object.mode_set(mode="EDIT")
+        try:
+            bpy.ops.mesh.select_all(action="SELECT")
+            getattr(bpy.ops.uv, UV_METHODS[method])(**kwargs)
+        finally:
+            bpy.ops.object.mode_set(mode="OBJECT")
+    layers = [uv.name for uv in getattr(o.data, "uv_layers", [])]
+    return {"object": o.name, "method": method, "uv_layers": layers}
+
+
+BOOL_OPS = {"difference": "DIFFERENCE", "union": "UNION", "intersect": "INTERSECT"}
+
+
+def cmd_boolean(args):
+    """Boolean tra due mesh: difference (buca), union (unisce), intersect. apply=true la applica subito;
+    hide_cutter nasconde l'oggetto che taglia."""
+    o, cutter = _mesh_obj(args["object"]), _mesh_obj(args["cutter"])
+    if o == cutter:
+        raise ValueError("object e cutter devono essere diversi")
+    kind = BOOL_OPS.get(str(args.get("operation", "difference")).lower())
+    if kind is None:
+        raise ValueError("operation: difference | union | intersect")
+    mod = o.modifiers.new(args.get("name") or f"Bool_{cutter.name}", "BOOLEAN")
+    mod.operation, mod.object = kind, cutter
+    with contextlib.suppress(Exception):
+        mod.solver = "EXACT"
+    if args.get("hide_cutter", True):
+        cutter.hide_viewport = cutter.hide_render = True
+    out = {"object": o.name, "cutter": cutter.name, "operation": kind.lower(), "modifier": mod.name, "applied": False}
+    if args.get("apply"):
+        cmd_apply_modifier({"object": o.name, "modifier": mod.name})
+        out["applied"] = True
+        if o.type == "MESH":
+            out["mesh"] = _counts(o.data)
+    return out
+
+
+def _fcurves(ad):
+    """F-curve dell'azione: API classica fino a 4.x, channelbag delle azioni a strati (4.4+, unica in 5.x)."""
+    if ad is None or ad.action is None:
+        return []
+    fc = getattr(ad.action, "fcurves", None)
+    if fc is not None:
+        with contextlib.suppress(Exception):
+            len(fc)
+            return fc
+    with contextlib.suppress(Exception):
+        from bpy_extras import anim_utils
+        bag = anim_utils.action_get_channelbag_for_slot(ad.action, ad.action_slot)
+        if bag is not None:
+            return bag.fcurves
+    return []
+
+
+INTERP = {"linear": "LINEAR", "bezier": "BEZIER", "constant": "CONSTANT", "ease": "BEZIER", "bounce": "BOUNCE",
+          "elastic": "ELASTIC", "back": "BACK", "sine": "SINE"}
+
+
+def cmd_animate(args):
+    """Piu' chiavi in un colpo: keys=[{"frame": 1, "value": [0,0,0]}, {"frame": 48, "value": [0,0,3]}].
+    interpolation: linear, bezier, constant, bounce, elastic, back, sine. cycles=true ripete all'infinito.
+    clear=true cancella prima l'animazione di quella proprieta'."""
+    o = _obj(args["object"])
+    prop = {"rotation": "rotation_euler"}.get(args.get("property", "location"), args.get("property", "location"))
+    keys = args.get("keys") or []
+    if not keys and not args.get("clear"):
+        raise ValueError("servono keys [{frame, value}, ...]")
+    interp = INTERP.get(str(args.get("interpolation", "bezier")).lower())
+    if interp is None:
+        raise ValueError(f"interpolation: {', '.join(INTERP)}")
+    owner, attr = _resolve(o, prop)
+    ad = getattr(o, "animation_data", None)
+    if args.get("clear"):
+        fcs = _fcurves(ad)
+        for fc in [f for f in fcs if f.data_path == attr]:
+            fcs.remove(fc)
+    for k in keys:
+        if "frame" not in k or "value" not in k:
+            raise ValueError("ogni chiave vuole frame e value")
+    for k in keys:
+        value = k["value"]
+        if attr == "rotation_euler":
+            value = tuple(math.radians(a) for a in _three(value, "rotation"))
+        setattr(owner, attr, value)
+        owner.keyframe_insert(data_path=attr, frame=float(k["frame"]))
+    ad = getattr(o, "animation_data", None)
+    curves = 0
+    for fc in _fcurves(ad):
+        if fc.data_path != attr:
+            continue
+        curves += 1
+        for kp in fc.keyframe_points:
+            kp.interpolation = interp
+            if str(args.get("interpolation", "")).lower() == "ease":
+                kp.easing = "EASE_IN_OUT"
+        if args.get("cycles") and not any(m.type == "CYCLES" for m in fc.modifiers):
+            fc.modifiers.new("CYCLES")
+    frames = [float(k["frame"]) for k in keys]
+    if frames and args.get("fit_range"):
+        bpy.context.scene.frame_start, bpy.context.scene.frame_end = int(min(frames)), int(max(frames))
+    return {"object": o.name, "property": prop, "keys": len(keys), "curves": curves, "interpolation": interp.lower(),
+            "range": [min(frames), max(frames)] if frames else None}
+
+
+def _gn_inputs(group):
+    items = []
+    iface = getattr(group, "interface", None)
+    if iface is not None:  # Blender 4.0+
+        for it in iface.items_tree:
+            if getattr(it, "item_type", "SOCKET") == "SOCKET" and getattr(it, "in_out", "INPUT") == "INPUT":
+                items.append({"name": it.name, "identifier": it.identifier, "type": getattr(it, "socket_type", "")})
+    else:  # 3.x
+        for it in group.inputs:
+            items.append({"name": it.name, "identifier": it.identifier, "type": it.type})
+    return items
+
+
+def cmd_geometry_nodes(args):
+    """Geometry Nodes su un oggetto: list (gruppi nel file e ingressi del modificatore), add (modificatore con un
+    gruppo esistente), set (valori degli ingressi per nome: {"Count": 20, "Radius": 0.5})."""
+    action = args.get("action", "list")
+    groups = [g for g in bpy.data.node_groups if getattr(g, "bl_idname", "") == "GeometryNodeTree"]
+    if action == "list" and not args.get("object"):
+        return {"groups": [{"name": g.name, "inputs": _gn_inputs(g)} for g in groups]}
+    o = _obj(args["object"])
+    mods = [m for m in o.modifiers if m.type == "NODES"]
+    if action == "add":
+        gname = args.get("group")
+        g = bpy.data.node_groups.get(gname) if gname else None
+        if g is None:
+            raise ValueError(f"gruppo Geometry Nodes non trovato: {gname} (ci sono: {[x.name for x in groups]})")
+        mod = o.modifiers.new(args.get("name") or g.name, "NODES")
+        mod.node_group = g
+        mods = [mod]
+    mod = None
+    if args.get("modifier"):
+        mod = _modifier(o, args["modifier"])
+    elif mods:
+        mod = mods[-1]
+    if mod is None:
+        raise ValueError(f"{o.name} non ha modificatori Geometry Nodes: usa action='add'")
+    inputs = _gn_inputs(mod.node_group) if mod.node_group else []
+    if action == "set":
+        by_name = {i["name"].lower(): i["identifier"] for i in inputs}
+        values = args.get("inputs") or {}
+        bad = [k for k in values if k.lower() not in by_name and k not in {i["identifier"] for i in inputs}]
+        if bad:
+            raise ValueError(f"ingressi sconosciuti: {bad} (ci sono: {[i['name'] for i in inputs]})")
+        for k, v in values.items():
+            mod[by_name.get(k.lower(), k)] = tuple(v) if isinstance(v, list) else v
+        with contextlib.suppress(Exception):
+            o.update_tag()
+    elif action not in ("list", "add"):
+        raise ValueError("action: list | add | set")
+    current = {}
+    for i in inputs:
+        with contextlib.suppress(Exception):
+            current[i["name"]] = _plain(mod[i["identifier"]])
+    return {"object": o.name, "modifier": mod.name, "group": mod.node_group.name if mod.node_group else None,
+            "inputs": inputs, "values": current}
+
+
+TEX_SLOTS = {"base_color": "Base Color", "roughness": "Roughness", "metallic": "Metallic", "normal": "Normal",
+             "emission": "Emission Color", "alpha": "Alpha", "bump": "Normal"}
+
+
+def cmd_material_nodes(args):
+    """Materiale avanzato: qualsiasi ingresso del Principled BSDF per nome (inputs={"Alpha": 0.5,
+    "Transmission Weight": 1, "IOR": 1.45}) e texture da file collegate al posto giusto
+    (texture=percorso, slot: base_color, roughness, metallic, normal, bump, emission, alpha)."""
+    if args.get("object"):
+        o = _obj(args["object"])
+        if not hasattr(o.data, "materials"):
+            raise ValueError(f"{o.name} ({o.type}) non puo' avere materiali")
+        if not len(o.material_slots) or o.material_slots[0].material is None:
+            cmd_set_material({"object": o.name, "name": args.get("material") or None})
+        mat = o.material_slots[0].material
+    else:
+        mat = bpy.data.materials.get(args.get("material") or "")
+        if mat is None:
+            raise ValueError("indica object oppure il nome di un material esistente")
+    mat.use_nodes = True
+    nodes, links = mat.node_tree.nodes, mat.node_tree.links
+    bsdf = next((n for n in nodes if n.type == "BSDF_PRINCIPLED"), None)
+    if bsdf is None:
+        raise RuntimeError(f"il materiale {mat.name} non ha un nodo Principled BSDF")
+    inputs = args.get("inputs") or {}
+    bad = [k for k in inputs if k not in bsdf.inputs]
+    if bad:
+        raise ValueError(f"ingressi non trovati nel Principled BSDF: {bad} (ci sono: {list(bsdf.inputs.keys())[:40]})")
+    for k, v in inputs.items():
+        bsdf.inputs[k].default_value = _rgba(v, k) if isinstance(v, list) and len(v) in (3, 4) and "Color" in k else v
+    linked = None
+    if args.get("texture"):
+        path = os.path.abspath(os.path.expanduser(args["texture"]))
+        if not os.path.isfile(path):
+            raise ValueError(f"texture non trovata: {path}")
+        slot = str(args.get("slot", "base_color")).lower()
+        target = TEX_SLOTS.get(slot)
+        if target is None or target not in bsdf.inputs:
+            raise ValueError(f"slot: {', '.join(TEX_SLOTS)}")
+        img = bpy.data.images.load(path, check_existing=True)
+        tex = nodes.new("ShaderNodeTexImage")
+        tex.image = img
+        if slot not in ("base_color", "emission"):
+            with contextlib.suppress(Exception):
+                img.colorspace_settings.name = "Non-Color"
+        if slot in ("normal", "bump"):
+            mid = nodes.new("ShaderNodeNormalMap" if slot == "normal" else "ShaderNodeBump")
+            links.new(tex.outputs["Color"], mid.inputs["Color" if slot == "normal" else "Height"])
+            links.new(mid.outputs["Normal"], bsdf.inputs["Normal"])
+        else:
+            links.new(tex.outputs["Alpha" if slot == "alpha" else "Color"], bsdf.inputs[target])
+        linked = {"image": img.name, "slot": slot}
+    return {"material": mat.name, "set": list(inputs), "texture": linked}
+
+
+def cmd_rigid_body(args):
+    """Fisica rigida: add (active = cade e urta, passive = pavimento/ostacolo, con mass, shape, friction, bounce),
+    remove, bake (calcola la simulazione nel range della scena)."""
+    action = args.get("action", "add")
+    if action == "bake":
+        with bpy.context.temp_override(window=_window()):
+            bpy.ops.ptcache.bake_all(bake=True)
+        return {"baked": True, "frames": [bpy.context.scene.frame_start, bpy.context.scene.frame_end]}
+    objs = [_mesh_obj(n) for n in args.get("objects") or []]
+    if not objs:
+        raise ValueError("servono objects")
+    kind = str(args.get("type", "active")).upper()
+    if kind not in ("ACTIVE", "PASSIVE"):
+        raise ValueError("type: active | passive")
+    done = []
+    for o in objs:
+        with bpy.context.temp_override(window=_window(), object=o, active_object=o, selected_objects=[o]):
+            if action == "remove":
+                if getattr(o, "rigid_body", None) is not None:
+                    bpy.ops.rigidbody.object_remove()
+                done.append(o.name)
+                continue
+            if action != "add":
+                raise ValueError("action: add | remove | bake")
+            if getattr(o, "rigid_body", None) is None:
+                bpy.ops.rigidbody.object_add(type=kind)
+        rb = o.rigid_body
+        rb.type = kind
+        for key, attr in (("mass", "mass"), ("friction", "friction"), ("bounce", "restitution")):
+            if args.get(key) is not None:
+                setattr(rb, attr, float(args[key]))
+        if args.get("shape"):
+            rb.collision_shape = str(args["shape"]).upper()
+        done.append(o.name)
+    return {"action": action, "type": kind.lower(), "objects": done}
+
+
+def cmd_scene_stats(args):
+    """Quanto pesa la scena: vertici e facce totali e per oggetto (i piu' pesanti), modificatori che moltiplicano
+    la geometria, materiali, immagini e loro risoluzione."""
+    rows, tv, tf = [], 0, 0
+    for o in bpy.context.scene.objects:
+        if o.type != "MESH":
+            continue
+        v, f = len(o.data.vertices), len(o.data.polygons)
+        tv, tf = tv + v, tf + f
+        heavy = [f"{m.type}:{getattr(m, 'levels', '')}" for m in o.modifiers if m.type in ("SUBSURF", "MULTIRES", "ARRAY", "REMESH")]
+        rows.append({"name": o.name, "vertices": v, "faces": f, **({"multiplying_modifiers": heavy} if heavy else {})})
+    rows.sort(key=lambda r: r["faces"], reverse=True)
+    imgs = []
+    for im in bpy.data.images:
+        size = list(getattr(im, "size", (0, 0)) or (0, 0))
+        imgs.append({"name": im.name, "size": size})
+    top = max(1, min(int(args.get("top", 10)), 100))
+    return {"objects": len(bpy.context.scene.objects), "meshes": len(rows), "vertices": tv, "faces": tf,
+            "heaviest": rows[:top], "materials": len(bpy.data.materials), "images": imgs[:50]}
+
+
+
 COMMANDS = {name[4:]: fn for name, fn in list(globals().items()) if name.startswith("cmd_")}
 
 
 READ_ONLY = {"status", "scene_info", "object_info", "viewport_screenshot", "find_objects",
              "get_property", "api_info", "missing_files", "render_preview", "undo", "export_file",
-             "render_image", "save_file"}
+             "render_image", "save_file", "checkpoint", "save_copy", "scene_stats"}
 
 
 def _undo_push(name):

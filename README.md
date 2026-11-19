@@ -51,7 +51,7 @@ uv run --script check_live.py
 
 Crea oggetti di prova, verifica ogni funzione e li elimina.
 
-## Tool (40)
+## Tool (51)
 
 **Avvio** — `open_blender(file, wait_seconds)`: apre Blender (o un .blend) e aspetta
 il ponte; se e' gia' aperto non ne apre un altro
@@ -91,6 +91,29 @@ piccolo, come immagine) · `set_viewport(shading, frame, camera_view)`
 **File** — `import_file(path)` · `export_file(path, selected_only)` (glb, gltf,
 fbx, obj, stl, usd) · `save_file(path)`
 
+**Checkpoint (1.2)** — `checkpoint(action, name)`: punti di ripristino dell'intera scena oltre
+l'undo (save fa una copia del file senza toccare quello aperto, restore la riapre), list, delete
+
+**Modellazione (1.2)** — `mesh_ops(object, op, settings)`: subdivide, bevel, triangulate,
+merge_by_distance, recalc_normals, flip_normals, dissolve_limited, inset, smooth_vertices,
+shade_smooth / shade_flat · `uv_unwrap(object, method)` (smart, unwrap, cube, sphere, cylinder,
+lightmap) · `boolean(object, cutter, operation, apply)` (difference, union, intersect)
+
+**Materiali, nodi, fisica (1.2)** — `material_nodes(object, inputs, texture, slot)`: qualsiasi
+ingresso del Principled BSDF per nome e texture da file collegate (base_color, roughness,
+metallic, normal con Normal Map, bump, emission, alpha) · `geometry_nodes(action, object,
+group, inputs)`: elenca i gruppi, aggiunge il modificatore, imposta gli ingressi per nome ·
+`rigid_body(action, objects, type, mass, shape)`: active/passive, remove, bake
+
+**Animazione in un colpo (1.2)** — `animate(object, keys, property, interpolation, cycles)`:
+tutte le chiavi insieme, interpolazione (linear, bezier, ease, bounce, elastic…), ciclo
+infinito; funziona anche con le azioni a strati di Blender 4.4+/5.x
+
+**Render lunghi e controlli (1.2)** — `background_render(action, output, frame_start, frame_end)`:
+renderizza una copia della scena con un secondo Blender in background (start, status con
+percentuale e file salvati, cancel, list) mentre continui a lavorare · `scene_stats(top)`: cosa
+pesa nella scena · `view_object(name, shading)`: inquadra un oggetto e ne restituisce l'immagine
+
 **Annulla e lotti** — ogni comando che cambia la scena e' un passo di annullamento
 (Ctrl+Z) · `undo(steps, redo)` · `batch(commands)`: piu' comandi in una chiamata, si
 ferma al primo errore, un solo passo di annullamento
@@ -100,10 +123,16 @@ e `bmesh`. Quello che assegni a `result` torna indietro.
 
 **Prompt** — `costruisci_scena(descrizione)` · `controlla_file`
 
-> I tool aggiunti nella 1.1 (tutti tranne i primi 14) sono provati contro il finto
-> Blender; `check_live.py` ne prova dal vivo la maggior parte. `undo` dal ponte non e'
+> I tool aggiunti nella 1.1 e nella 1.2 sono provati contro il finto Blender;
+> `check_live.py` ne prova dal vivo la maggior parte (non `checkpoint restore`, `geometry_nodes`
+> e `background_render`). `undo` dal ponte non e'
 > ancora stato provato su Blender vero. Dopo l'aggiornamento reinstalla l'add-on
 > (passo 2) e riavvia Blender.
+
+Confronto (novembre 2026): StraySpark Blender MCP (a pagamento, 404 tool) ha checkpoint, lavori
+asincroni e visione economica; i fork gratuiti (6xvl ~270, naab007 92, emeryporter 86) hanno tool
+tipizzati per mesh, UV, rig ed export. Dalla 1.2 qui ci sono checkpoint, render in background
+con avanzamento, operazioni mesh, UV, boolean, Geometry Nodes, materiali a nodi e fisica.
 
 Niente servizi esterni di proposito: niente download da Poly Haven, Sketchfab o
 generatori 3D online come in altri MCP per Blender. Per gli HDRI usa file sul disco

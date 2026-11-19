@@ -68,6 +68,10 @@ class Mesh(Datablock):
     def __init__(self, name):
         super().__init__(name)
         self.vertices, self.edges, self.polygons = [], [], []
+        self.uv_layers = []
+
+    def update(self):
+        pass
 
     def copy(self):
         m = Mesh(self.name + ".001")
@@ -113,6 +117,20 @@ class Slot:
 class Modifier:
     def __init__(self, name, kind):
         self.name, self.type, self.levels, self.width = name, kind, 1, 0.1
+        self.operation, self.object, self.solver, self.node_group = "DIFFERENCE", None, "FAST", None
+        self._items = {}
+
+    def __setitem__(self, k, v):
+        self._items[k] = v
+
+    def __getitem__(self, k):
+        if k not in self._items:
+            g = self.node_group
+            for it in (g.interface.items_tree if g else []):
+                if it.identifier == k:
+                    return it.default_value
+            raise KeyError(k)
+        return self._items[k]
 
 
 class Modifiers(list):
@@ -120,7 +138,7 @@ class Modifiers(list):
         return next((m for m in self if m.name == name), None)
 
     def new(self, name, kind):
-        if kind not in ("SUBSURF", "BEVEL", "ARRAY", "MIRROR", "SOLIDIFY"):
+        if kind not in ("SUBSURF", "BEVEL", "ARRAY", "MIRROR", "SOLIDIFY", "BOOLEAN", "NODES"):
             raise TypeError(f"enum {kind!r} not found")
         mod = Modifier(name, kind)
         self.append(mod)
@@ -165,6 +183,8 @@ class Object:
         self.users_collection = []
         self.selected = False
         self.keys = []
+        self.rigid_body = None
+        self.animation_data = None
 
     @property
     def matrix_world(self):
@@ -187,12 +207,33 @@ class Object:
 
     def keyframe_insert(self, data_path, frame=None, index=-1):
         self.keys.append((data_path, frame, index))
+        if getattr(self, "animation_data", None) is None:
+            self.animation_data = _t.SimpleNamespace(action=_t.SimpleNamespace(fcurves=_FCurves()))
+        fcs = self.animation_data.action.fcurves
+        n = 3 if data_path in ("location", "rotation_euler", "scale") else 1
+        for i in range(n):
+            fc = next((f for f in fcs if f.data_path == data_path and f.array_index == i), None)
+            if fc is None:
+                fc = _t.SimpleNamespace(data_path=data_path, array_index=i, keyframe_points=[], modifiers=_FModifiers())
+                fcs.append(fc)
+            fc.keyframe_points.append(_t.SimpleNamespace(co=(frame, 0.0), interpolation="BEZIER", easing="AUTO"))
 
     @property
     def material_slots(self):
         if self.data is None:
             return []
         return [Slot(self.data, i) for i in range(len(self.data.materials))]
+
+
+class _FCurves(list):
+    pass
+
+
+class _FModifiers(list):
+    def new(self, kind):
+        m = _t.SimpleNamespace(type=kind)
+        self.append(m)
+        return m
 
 
 class Socket:
@@ -203,17 +244,18 @@ class Socket:
 
     @property
     def links(self):
-        if scene.world is None:
-            return []
-        return [lk for lk in scene.world.node_tree.links if self in (lk.from_socket, lk.to_socket)]
+        trees = [w.node_tree for w in data.worlds] + [m.node_tree for m in data.materials]
+        return [lk for t in trees for lk in t.links if self in (lk.from_socket, lk.to_socket)]
 
 
 class Material:
     def __init__(self, name):
         self.name, self.use_nodes, self.diffuse_color = name, False, (0.8, 0.8, 0.8, 1.0)
-        inputs = {n: Socket() for n in ("Base Color", "Metallic", "Roughness", "Emission Color", "Emission Strength")}
+        inputs = {n: Socket() for n in ("Base Color", "Metallic", "Roughness", "Emission Color", "Emission Strength",
+                                         "Alpha", "Normal", "IOR", "Transmission Weight")}
         bsdf = _t.SimpleNamespace(type="BSDF_PRINCIPLED", inputs=inputs)
-        self.node_tree = _t.SimpleNamespace(nodes=[bsdf])
+        self.node_tree = NodeTree()
+        self.node_tree.nodes.append(bsdf)
 
 
 class CollectionObjects(list):
@@ -277,7 +319,10 @@ class Node:
 class NodeTree:
     KINDS = {"ShaderNodeBackground": ("BACKGROUND", ("Color", "Strength"), ("Background",)),
              "ShaderNodeOutputWorld": ("OUTPUT_WORLD", ("Surface",), ()),
-             "ShaderNodeTexEnvironment": ("TEX_ENVIRONMENT", (), ("Color",))}
+             "ShaderNodeTexEnvironment": ("TEX_ENVIRONMENT", (), ("Color",)),
+             "ShaderNodeTexImage": ("TEX_IMAGE", ("Vector",), ("Color", "Alpha")),
+             "ShaderNodeNormalMap": ("NORMAL_MAP", ("Color", "Strength"), ("Normal",)),
+             "ShaderNodeBump": ("BUMP", ("Height", "Strength"), ("Normal",))}
 
     def __init__(self):
         self.nodes = _NodeList(self)
@@ -338,7 +383,17 @@ class Image:
         self.name, self.filepath, self.source, self.packed_file = name, "", "FILE", None
 
 
+class NodeGroup:
+    def __init__(self, name, bl_idname="GeometryNodeTree"):
+        self.name, self.bl_idname = name, bl_idname
+        self.interface = _t.SimpleNamespace(items_tree=[
+            _t.SimpleNamespace(item_type="SOCKET", in_out="INPUT", name="Geometry", identifier="Socket_0", socket_type="NodeSocketGeometry", default_value=None),
+            _t.SimpleNamespace(item_type="SOCKET", in_out="INPUT", name="Count", identifier="Socket_1", socket_type="NodeSocketInt", default_value=10),
+            _t.SimpleNamespace(item_type="SOCKET", in_out="OUTPUT", name="Geometry", identifier="Socket_2", socket_type="NodeSocketGeometry", default_value=None)])
+
+
 data = _t.SimpleNamespace(
+    node_groups=Store(NodeGroup),
     objects=Store(Object), meshes=Store(Mesh), lights=Store(Light), cameras=Store(Camera),
     curves=Store(Curve), materials=Store(Material), collections=Store(Collection),
     worlds=Store(World), images=Store(Image), filepath="",
@@ -357,10 +412,19 @@ def _main_only():
     assert threading.current_thread() is main_thread, "Blender toccato fuori dal thread principale"
 
 
+_override = {}
+
+
 @contextlib.contextmanager
 def _temp_override(**kwargs):
     _main_only()
-    yield
+    old = dict(_override)
+    _override.update(kwargs)
+    try:
+        yield
+    finally:
+        _override.clear()
+        _override.update(old)
 
 
 class _LayerObjects:
@@ -420,20 +484,58 @@ def _record(name):
     return op
 
 
-def _save_as(filepath):
-    data.filepath = filepath
+def _save_as(filepath, copy=False):
+    _main_only()
+    with open(filepath, "wb") as f:
+        f.write(b"BLENDER-finto")
+    calls.append(("save_as", filepath, copy))
+    if not copy:
+        data.filepath = filepath
+
+
+def _ctx_obj():
+    return _override.get("object") or context.view_layer.objects.active
+
+
+def _uv_op(name):
+    def op(**kwargs):
+        _main_only()
+        calls.append((name, kwargs))
+        o = _ctx_obj()
+        if o is not None and not o.data.uv_layers:
+            o.data.uv_layers.append(_t.SimpleNamespace(name="UVMap"))
+    return op
+
+
+def _rb_add(type="ACTIVE"):
+    _main_only()
+    o = _ctx_obj()
+    o.rigid_body = _t.SimpleNamespace(type=type, mass=1.0, friction=0.5, restitution=0.0, collision_shape="CONVEX_HULL")
+    calls.append(("rigidbody_add", o.name))
+
+
+def _rb_remove():
+    _main_only()
+    _ctx_obj().rigid_body = None
 
 
 ops = _t.SimpleNamespace(
     render=_t.SimpleNamespace(opengl=_opengl, render=_render),
-    object=_t.SimpleNamespace(modifier_apply=_modifier_apply),
+    object=_t.SimpleNamespace(modifier_apply=_modifier_apply, mode_set=_record("mode_set"),
+                              shade_auto_smooth=_record("shade_auto_smooth")),
+    mesh=_t.SimpleNamespace(select_all=_record("select_all")),
+    uv=_t.SimpleNamespace(**{n: _uv_op(n) for n in ("smart_project", "unwrap", "cube_project", "sphere_project",
+                                                     "cylinder_project", "lightmap_pack")}),
+    rigidbody=_t.SimpleNamespace(object_add=_rb_add, object_remove=_rb_remove),
+    ptcache=_t.SimpleNamespace(bake_all=_record("bake_all")),
     ed=_t.SimpleNamespace(undo=_record("undo"), redo=_record("redo"), undo_push=_record("undo_push")),
     view3d=_t.SimpleNamespace(view_all=_record("view_all"), view_selected=_record("view_selected")),
     import_scene=_t.SimpleNamespace(gltf=_import, fbx=_import),
     export_scene=_t.SimpleNamespace(gltf=_export, fbx=_export),
     wm=_t.SimpleNamespace(obj_import=_import, obj_export=_export, stl_import=_import, stl_export=_export,
                              usd_import=_import, usd_export=_export,
-                             save_as_mainfile=_save_as, save_mainfile=lambda: None),
+                             save_as_mainfile=_save_as, save_mainfile=lambda: None,
+                             open_mainfile=_record("open_mainfile")),
 )
 
 _timers = []
@@ -441,7 +543,7 @@ _timers = []
 
 class _Timers:
     @staticmethod
-    def register(fn, persistent=False):
+    def register(fn, first_interval=0, persistent=False):
         _timers.append(fn)
 
 
@@ -477,7 +579,23 @@ def run_main_loop(until, timeout=30):
 
 class _BMesh:
     def to_mesh(self, mesh):
-        mesh.vertices, mesh.edges, mesh.polygons = [0] * self.counts[0], [0] * self.counts[1], [0] * self.counts[2]
+        mesh.vertices, mesh.edges = [0] * self.counts[0], [0] * self.counts[1]
+        mesh.polygons = [_t.SimpleNamespace(use_smooth=False) for _ in range(self.counts[2])]
+
+    def from_mesh(self, mesh):
+        self.counts = (len(mesh.vertices), len(mesh.edges), len(mesh.polygons))
+
+    @property
+    def verts(self):
+        return [0] * self.counts[0]
+
+    @property
+    def edges(self):
+        return [0] * self.counts[1]
+
+    @property
+    def faces(self):
+        return [0] * self.counts[2]
 
     def free(self):
         pass
@@ -487,6 +605,14 @@ def _maker(counts):
     def make(bm, **kwargs):
         bm.counts = counts
     return make
+
+
+def _edit(rule):
+    def op(bm, **kwargs):
+        _main_only()
+        calls.append(("bmesh", kwargs.get("cuts"), sorted(kwargs)))
+        bm.counts = rule(*bm.counts, kwargs)
+    return op
 
 
 def _bmesh_module():
@@ -501,7 +627,12 @@ def _bmesh_module():
     m.ops = _t.SimpleNamespace(
         create_cube=_maker((8, 12, 6)), create_grid=_maker((4, 4, 1)), create_uvsphere=_maker((482, 992, 512)),
         create_icosphere=_maker((42, 120, 80)), create_cone=_maker((64, 96, 34)),
-        create_circle=_maker((32, 32, 1)), create_monkey=_maker((507, 1005, 500)))
+        create_circle=_maker((32, 32, 1)), create_monkey=_maker((507, 1005, 500)),
+        subdivide_edges=_edit(lambda v, e, f, k: (v + e * k.get("cuts", 1) + f * k.get("cuts", 1) ** 2, e * 2 * (k.get("cuts", 1) + 1), f * (k.get("cuts", 1) + 1) ** 2)),
+        bevel=_edit(lambda v, e, f, k: (v * 3, e * 3, f + e)), triangulate=_edit(lambda v, e, f, k: (v, e + f, f * 2)),
+        remove_doubles=_edit(lambda v, e, f, k: (v, e, f)), recalc_face_normals=_edit(lambda v, e, f, k: (v, e, f)),
+        reverse_faces=_edit(lambda v, e, f, k: (v, e, f)), dissolve_limit=_edit(lambda v, e, f, k: (v, e, f)),
+        inset_region=_edit(lambda v, e, f, k: (v * 2, e * 2, f * 2)), smooth_vert=_edit(lambda v, e, f, k: (v, e, f)))
     return m
 
 

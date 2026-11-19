@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2,<2"]
+# dependencies = ["mcp>=1.10,<3"]
 # ///
 """AJ Blender MCP: server MCP che pilota Blender.
 
@@ -13,12 +13,14 @@ Config (variabili d'ambiente, tutte facoltative):
   AJ_BLENDER_EXE    eseguibile di Blender per open_blender (default: cercato da solo)
 """
 import base64
+import contextlib
 import glob
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -457,6 +459,182 @@ def batch(commands: list[dict[str, Any]]) -> dict:
     return call("batch", commands=commands)
 
 
+# ------------------------------------------------- checkpoint, mesh, fisica (1.2)
+@mcp.tool()
+def checkpoint(action: str = "list", name: str = "", note: str = "") -> dict:
+    """Punti di ripristino dell'INTERA scena, oltre l'undo: save (copia del file in ~/.aj-mcp/blender-checkpoints,
+    la scena aperta non cambia), list, restore (riapre la copia: tutto torna com'era), delete.
+    Salva un checkpoint prima di lavori grossi (boolean, applicare modificatori, fisica)."""
+    return call("checkpoint", action=action, name=name or None, note=note or None)
+
+
+@mcp.tool()
+def mesh_ops(object: str, op: str, settings: dict[str, Any] | None = None) -> dict:
+    """Operazioni sulla mesh intera, senza modalita' modifica: subdivide {cuts, smooth}, bevel {width, segments,
+    profile}, triangulate, merge_by_distance {distance}, recalc_normals, flip_normals, dissolve_limited {angle},
+    inset {thickness, depth}, smooth_vertices {factor, repeat}, shade_smooth {auto_angle}, shade_flat.
+    Diversamente da un modificatore cambia la mesh davvero (Ctrl+Z la riporta indietro)."""
+    return call("mesh_ops", object=object, op=op, settings=settings)
+
+
+@mcp.tool()
+def uv_unwrap(object: str, method: str = "smart", angle: float = 66, margin: float = 0.02) -> dict:
+    """Crea le UV di una mesh in un colpo: smart (Smart UV Project, va bene quasi sempre), unwrap (sulle
+    cuciture), cube, sphere, cylinder, lightmap. Serve prima di applicare texture con material_nodes."""
+    return call("uv_unwrap", object=object, method=method, angle=angle, margin=margin)
+
+
+@mcp.tool()
+def boolean(object: str, cutter: str, operation: str = "difference", apply: bool = False,
+            hide_cutter: bool = True) -> dict:
+    """Boolean tra due mesh: difference (fa un buco con la forma di cutter), union, intersect. Con apply=true la
+    applica subito; hide_cutter nasconde l'oggetto che taglia. Consiglio: checkpoint prima di applicare."""
+    return call("boolean", object=object, cutter=cutter, operation=operation, apply=apply or None,
+                hide_cutter=hide_cutter)
+
+
+@mcp.tool()
+def animate(object: str, keys: list[dict[str, Any]] | None = None, property: str = "location",
+            interpolation: str = "bezier", cycles: bool = False, clear: bool = False, fit_range: bool = False) -> dict:
+    """Animazione in una chiamata: keys=[{"frame": 1, "value": [0, 0, 0]}, {"frame": 48, "value": [0, 0, 3]}].
+    property: location, rotation (gradi), scale o un percorso. interpolation: linear, bezier, ease, constant,
+    bounce, elastic, back, sine. cycles=true ripete all'infinito, clear=true cancella prima le chiavi di quella
+    proprieta', fit_range=true adatta inizio/fine della scena."""
+    return call("animate", object=object, keys=keys, property=property, interpolation=interpolation,
+                cycles=cycles or None, clear=clear or None, fit_range=fit_range or None)
+
+
+@mcp.tool()
+def geometry_nodes(action: str = "list", object: str = "", group: str = "", modifier: str = "",
+                   inputs: dict[str, Any] | None = None) -> dict:
+    """Geometry Nodes: list (senza object: i gruppi nel file con i loro ingressi; con object: il modificatore e i
+    valori), add (aggiunge a object il modificatore con un gruppo esistente), set (valori degli ingressi per nome,
+    es. {"Count": 20, "Radius": 0.5})."""
+    return call("geometry_nodes", action=action, object=object or None, group=group or None,
+                modifier=modifier or None, inputs=inputs)
+
+
+@mcp.tool()
+def material_nodes(object: str = "", material: str = "", inputs: dict[str, Any] | None = None,
+                   texture: str = "", slot: str = "base_color") -> dict:
+    """Materiale avanzato: qualsiasi ingresso del Principled BSDF per nome ({"Alpha": 0.5, "Transmission Weight":
+    1, "IOR": 1.45, "Coat Weight": 0.3}) e una texture da file collegata al posto giusto: slot base_color,
+    roughness, metallic, normal (con Normal Map), bump, emission, alpha. Le texture vogliono le UV (uv_unwrap)."""
+    return call("material_nodes", object=object or None, material=material or None, inputs=inputs,
+                texture=texture or None, slot=slot)
+
+
+@mcp.tool()
+def rigid_body(action: str = "add", objects: list[str] | None = None, type: str = "active", mass: float | None = None,
+               shape: str = "", friction: float | None = None, bounce: float | None = None) -> dict:
+    """Fisica rigida: add (type active = cade e urta, passive = pavimento o ostacolo; mass, shape: convex_hull,
+    box, sphere, mesh..., friction, bounce), remove, bake (calcola la simulazione nel range della scena)."""
+    return call("rigid_body", action=action, objects=objects, type=type, mass=mass, shape=shape or None,
+                friction=friction, bounce=bounce)
+
+
+@mcp.tool()
+def scene_stats(top: int = 10) -> dict:
+    """Quanto pesa la scena: vertici e facce totali, gli oggetti piu' pesanti, i modificatori che moltiplicano la
+    geometria (subsurf, array...), materiali e immagini. Per capire perche' il viewport o il render sono lenti."""
+    return call("scene_stats", top=top)
+
+
+@mcp.tool()
+def view_object(name: str, shading: str = "", max_size: int = 800) -> Image:
+    """Inquadra un oggetto nella vista 3D (eventualmente con shading: solid, material, rendered) e ne restituisce
+    l'immagine: per controllare un pezzo senza cambiare la camera."""
+    call("set_viewport", shading=shading or None, frame=name)
+    r = call("viewport_screenshot", max_size=max_size)
+    return Image(data=base64.b64decode(r["png_base64"]), format="png")
+
+
+# ------------------------------------------------------- render in background (1.2)
+_render_jobs: dict[str, dict[str, Any]] = {}
+
+
+def _watch_render(job: dict[str, Any]) -> None:
+    proc = job["proc"]
+    for raw in proc.stdout:
+        line = raw.decode("utf-8", "replace").strip() if isinstance(raw, bytes) else str(raw).strip()
+        if not line:
+            continue
+        job["log"].append(line)
+        del job["log"][:-40]
+        if line.startswith("Fra:"):
+            with contextlib.suppress(ValueError, IndexError):
+                job["frame"] = int(line.split()[0][4:])
+        if line.startswith("Saved:"):
+            job["saved"].append(line.split(":", 1)[1].strip().strip("'\""))
+    proc.wait()
+    job["exit_code"] = proc.returncode
+    job["ended"] = time.time()
+
+
+def _job_view(jid: str, job: dict[str, Any]) -> dict[str, Any]:
+    first, last = job["frames"]
+    total = last - first + 1
+    done = len(job["saved"])
+    state = "running" if job.get("exit_code") is None else ("done" if job["exit_code"] == 0 and not job.get("cancelled") else
+                                                             ("cancelled" if job.get("cancelled") else "failed"))
+    return {"job": jid, "state": state, "frames": [first, last], "current_frame": job.get("frame"),
+            "saved": done, "total": total, "percent": round(100 * done / total, 1) if total else None,
+            "elapsed_s": round((job.get("ended") or time.time()) - job["started"], 1),
+            "last_files": job["saved"][-3:], "output": job["output"],
+            **({"log_tail": job["log"][-8:]} if state == "failed" else {})}
+
+
+@mcp.tool()
+def background_render(action: str = "start", output: str = "", frame_start: int | None = None,
+                      frame_end: int | None = None, job: str = "") -> dict:
+    """Render LUNGHI senza bloccare Blender: salva una copia della scena e la renderizza con un secondo Blender in
+    background. action: start (output = cartella o modello come C:/render/shot_####.png; senza frame usa il range
+    della scena; frame_start = frame_end per un fotogramma solo), status (avanzamento in %, file salvati),
+    cancel, list. Mentre gira puoi continuare a lavorare nella scena."""
+    if action == "list":
+        return {"jobs": [_job_view(j, x) for j, x in _render_jobs.items()]}
+    if action in ("status", "cancel"):
+        jid = job or (list(_render_jobs)[-1] if _render_jobs else "")
+        x = _render_jobs.get(jid)
+        if x is None:
+            raise RuntimeError(f"lavoro non trovato: {jid or '(nessuno avviato)'}")
+        if action == "cancel" and x.get("exit_code") is None:
+            x["cancelled"] = True
+            x["proc"].terminate()
+            with contextlib.suppress(Exception):
+                x["proc"].wait(timeout=10)
+        return _job_view(jid, x)
+    if action != "start":
+        raise RuntimeError("action: start | status | cancel | list")
+    exe = find_blender()
+    if not exe:
+        raise RuntimeError("eseguibile di Blender non trovato: imposta AJ_BLENDER_EXE")
+    if not output:
+        raise RuntimeError("serve output: una cartella o un modello come C:/render/shot_####.png")
+    out = os.path.abspath(os.path.expanduser(output))
+    if os.path.isdir(out) or out.endswith(("/", "\\")):
+        out = os.path.join(out, "frame_####")
+    if not os.path.isdir(os.path.dirname(out)):
+        raise RuntimeError(f"cartella non trovata: {os.path.dirname(out)}")
+    copy = call("save_copy")
+    first = int(frame_start if frame_start is not None else copy["frames"][0])
+    last = int(frame_end if frame_end is not None else (frame_start if frame_start is not None else copy["frames"][1]))
+    if last < first:
+        raise RuntimeError("frame_end prima di frame_start")
+    cmd = [exe, "-b", copy["file"], "-o", out, "-s", str(first), "-e", str(last), "-a"]
+    if exe.endswith(".py"):  # test: finto Blender scritto in Python
+        cmd = [sys.executable] + cmd
+    flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **flags)
+    jid = f"r{len(_render_jobs) + 1}"
+    x = {"proc": proc, "frames": [first, last], "output": out, "log": [], "saved": [], "started": time.time(),
+         "exit_code": None, "blend": copy["file"]}
+    _render_jobs[jid] = x
+    threading.Thread(target=_watch_render, args=(x,), daemon=True).start()
+    return {"job": jid, "started": True, "frames": [first, last], "output": out, "engine": copy["engine"],
+            "hint": "controlla con background_render(action='status')"}
+
+
 # -------------------------------------------------------------- prompt (1.1)
 @mcp.prompt()
 def costruisci_scena(descrizione: str) -> str:
@@ -466,7 +644,7 @@ def costruisci_scena(descrizione: str) -> str:
             "geometria; set_material; luci con create_object + set_light + look_at; una camera con "
             "set_camera e look_at; set_world per l'ambiente. Usa batch per i gruppi di comandi. "
             "Controlla con viewport_screenshot dopo ogni gruppo e con render_preview alla fine. "
-            "Se sbagli, undo.")
+            "Prima di passi pesanti (boolean applicati, fisica) checkpoint save. Se sbagli, undo.")
 
 
 @mcp.prompt()

@@ -14,6 +14,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -288,6 +289,108 @@ fails("passo 1", m.batch, [{"cmd": "delete_objects", "args": {"names": ["Lotto"]
 fails("non si puo' usare dentro batch", m.batch, [{"cmd": "undo"}])
 do(m.delete_objects, ["Cubo.002", "Cubo.003", "Cubo.004", "Cubo.005"])
 
+# --- 1.2: checkpoint, mesh, UV, boolean, animazione, geometry nodes, materiali, fisica, statistiche, render
+cp = do(m.checkpoint, "save", "prima_dei_buchi", note="prova")
+assert cp["saved"] == "prima_dei_buchi" and os.path.isfile(cp["file"]) and cp["note"] == "prova", cp
+assert any(c[0] == "save_as" and c[2] is True for c in fake_bpy.calls), "il checkpoint deve essere una copia"
+assert [c["name"] for c in do(m.checkpoint)["checkpoints"]] == ["prima_dei_buchi"]
+r = do(m.checkpoint, "restore", "prima_dei_buchi")
+assert r["restoring"] == "prima_dei_buchi"
+fake_bpy.run_main_loop(lambda: any(c[0] == "open_mainfile" for c in fake_bpy.calls))
+fails("checkpoint non trovato", m.checkpoint, "restore", "manca")
+fails("serve un nome", m.checkpoint, "save", "")
+do(m.checkpoint, "delete", "prima_dei_buchi")
+assert do(m.checkpoint)["checkpoints"] == []
+
+do(m.create_object, "cube", name="Blocco")
+do(m.create_object, "cylinder", name="Punta")
+r = do(m.mesh_ops, "Blocco", "subdivide", {"cuts": 2})
+assert r["before"]["faces"] == 6 and r["after"]["faces"] == 54, r
+r = do(m.mesh_ops, "Blocco", "shade_smooth")
+assert all(p.use_smooth for p in fake_bpy.data.objects["Blocco"].data.polygons), r
+fails("op:", m.mesh_ops, "Blocco", "esplodi")
+r = do(m.uv_unwrap, "Blocco")
+assert r["uv_layers"] == ["UVMap"] and any(c[0] == "smart_project" for c in fake_bpy.calls), r
+assert [c[1]["mode"] for c in fake_bpy.calls if c[0] == "mode_set"][-2:] == ["EDIT", "OBJECT"]
+fails("method:", m.uv_unwrap, "Blocco", "boh")
+r = do(m.boolean, "Blocco", "Punta")
+assert r["modifier"] == "Bool_Punta" and not r["applied"] and fake_bpy.data.objects["Punta"].hide_render, r
+r = do(m.boolean, "Blocco", "Punta", "union", apply=True, hide_cutter=False)
+assert r["applied"] and r["operation"] == "union", r
+fails("diversi", m.boolean, "Blocco", "Blocco")
+r = do(m.animate, "Blocco", [{"frame": 1, "value": [0, 0, 0]}, {"frame": 48, "value": [0, 0, 3]}],
+       interpolation="linear", cycles=True, fit_range=True)
+fc = fake_bpy.data.objects["Blocco"].animation_data.action.fcurves
+assert r["keys"] == 2 and r["curves"] == 3 and all(k.interpolation == "LINEAR" for f in fc for k in f.keyframe_points), r
+assert all(f.modifiers and f.modifiers[0].type == "CYCLES" for f in fc) and fake_bpy.scene.frame_end == 48
+fails("interpolation", m.animate, "Blocco", [{"frame": 1, "value": [0, 0, 0]}], interpolation="strana")
+fails("frame e value", m.animate, "Blocco", [{"frame": 1}])
+fake_bpy.data.node_groups.new("Sparpaglia")
+r = do(m.geometry_nodes)
+assert r["groups"][0]["name"] == "Sparpaglia" and [i["name"] for i in r["groups"][0]["inputs"]] == ["Geometry", "Count"], r
+r = do(m.geometry_nodes, "add", "Blocco", group="Sparpaglia")
+assert r["values"]["Count"] == 10, r
+r = do(m.geometry_nodes, "set", "Blocco", inputs={"count": 25})
+assert r["values"]["Count"] == 25, r
+fails("ingressi sconosciuti", m.geometry_nodes, "set", "Blocco", inputs={"Raggio": 1})
+fails("non trovato", m.geometry_nodes, "add", "Blocco", group="Manca")
+tex = Path(tempfile.mkdtemp()) / "legno.png"
+tex.write_bytes(fake_bpy.PNG_1X1)
+r = do(m.material_nodes, "Blocco", inputs={"Alpha": 0.5, "IOR": 1.45}, texture=str(tex), slot="base_color")
+mat = fake_bpy.data.objects["Blocco"].material_slots[0].material
+bsdf = mat.node_tree.nodes[0]
+assert r["texture"]["slot"] == "base_color" and bsdf.inputs["Alpha"].default_value == 0.5, r
+assert any(lk.to_socket is bsdf.inputs["Base Color"] for lk in mat.node_tree.links)
+do(m.material_nodes, "Blocco", texture=str(tex), slot="normal")
+assert any(n.type == "NORMAL_MAP" for n in mat.node_tree.nodes)
+fails("ingressi non trovati", m.material_nodes, "Blocco", inputs={"Brillantezza": 1})
+fails("texture non trovata", m.material_nodes, "Blocco", texture="/non/esiste.png")
+do(m.create_object, "plane", name="Pavimento")
+r = do(m.rigid_body, "add", ["Blocco"], mass=2.0, bounce=0.3)
+assert fake_bpy.data.objects["Blocco"].rigid_body.mass == 2.0 and fake_bpy.data.objects["Blocco"].rigid_body.restitution == 0.3, r
+do(m.rigid_body, "add", ["Pavimento"], type="passive")
+assert fake_bpy.data.objects["Pavimento"].rigid_body.type == "PASSIVE"
+assert do(m.rigid_body, "bake")["baked"]
+do(m.rigid_body, "remove", ["Pavimento"])
+assert fake_bpy.data.objects["Pavimento"].rigid_body is None
+r = do(m.scene_stats, top=2)
+assert r["faces"] > 0 and len(r["heaviest"]) == 2 and r["heaviest"][0]["faces"] >= r["heaviest"][1]["faces"], r
+img = do(m.view_object, "Blocco", shading="material")
+assert img.data[:4] == b"\x89PNG" and fake_bpy._space.shading.type == "MATERIAL"
+
+# render in background con un finto Blender da riga di comando
+fb = Path(tempfile.mkdtemp()) / "finto_blender.py"
+fb.write_text("""import sys, time
+a = sys.argv
+out, s, e = a[a.index("-o") + 1], int(a[a.index("-s") + 1]), int(a[a.index("-e") + 1])
+for f in range(s, e + 1):
+    print(f"Fra:{f} Mem:10M | Rendering", flush=True)
+    time.sleep(0.05)
+    print(f"Saved: '{out.replace('####', str(f).zfill(4))}.png'", flush=True)
+""")
+os.environ["AJ_BLENDER_EXE"] = str(fb)
+outdir = Path(tempfile.mkdtemp())
+r = do(m.background_render, "start", str(outdir), frame_start=1, frame_end=3)
+assert r["started"] and r["frames"] == [1, 3] and r["output"].endswith("frame_####"), r
+end = time.time() + 15
+while m.background_render("status")["state"] == "running" and time.time() < end:
+    time.sleep(0.1)
+st = m.background_render("status", job=r["job"])
+assert st["state"] == "done" and st["saved"] == 3 and st["percent"] == 100.0, st
+fb.write_text("import time\nprint('Fra:1', flush=True)\ntime.sleep(30)\n")
+r2 = do(m.background_render, "start", str(outdir), frame_start=5)
+time.sleep(0.5)
+st = m.background_render("cancel", job=r2["job"])
+assert st["state"] == "cancelled" and st["frames"] == [5, 5], st
+assert len(m.background_render("list")["jobs"]) == 2
+try:
+    m.background_render("start")
+    raise AssertionError("serviva output")
+except RuntimeError as e:
+    assert "serve output" in str(e)
+os.environ.pop("AJ_BLENDER_EXE")
+do(m.delete_objects, ["Blocco", "Punta", "Pavimento"])
+
 # --- elimina
 d = do(m.delete_objects, ["Cubo", "Manca"])
 assert d == {"deleted": ["Cubo"], "missing": ["Manca"]}, d
@@ -329,7 +432,7 @@ os.environ.pop("AJ_BLENDER_EXE")
 
 tools = asyncio.run(m.mcp.list_tools())
 names = sorted(t.name for t in tools)
-assert len(names) == 40, names
+assert len(names) == 51, names
 prompts = asyncio.run(m.mcp.list_prompts())
 assert sorted(p.name for p in prompts) == ["controlla_file", "costruisci_scena"], prompts
 print(f"ok: {len(names)} tool -> {', '.join(names)}")
